@@ -1,10 +1,12 @@
 {
-  "name": "notes4me",
+  "name": "notes4chris",
   "version": "1.0.0",
-  "description": "Privacy-focused meeting recorder with AI transcription and summarisation",
+  "description": "Privacy-focused dual-track meeting recorder with AI transcription and speaker-aware summarisation",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "build:sck": "cd native/sck-audio-capture && swift build -c release && codesign -f -s - --identifier com.christopherrobinson.sck-audio-capture .build/release/sck-audio-capture",
+    "prebuild": "npm run build:sck",
     "build": "electron-builder",
     "postinstall": "electron-builder install-app-deps",
     "summaryonly": "node summarise-only.js"
@@ -16,9 +18,11 @@
     "ai",
     "privacy",
     "notes",
-    "summarisation"
+    "summarisation",
+    "dual-track",
+    "speaker-separation"
   ],
-  "author": "Andy Jarrett",
+  "author": "Christopher Robinson",
   "license": "SEE LICENSE IN LICENSE",
   "dependencies": {
     "electron-store": "^8.2.0"
@@ -28,8 +32,8 @@
     "electron-builder": "^24.13.3"
   },
   "build": {
-    "appId": "com.andyjarrett.notes4me",
-    "productName": "Notes4Me",
+    "appId": "com.christopherrobinson.notes4chris",
+    "productName": "Notes4Chris",
     "publish": null,
     "mac": {
       "category": "public.app-category.productivity",
@@ -39,14 +43,25 @@
       ],
       "icon": "assets/icon.png",
       "hardenedRuntime": true,
-      "entitlements": "entitlements.mac.plist"
+      "entitlements": "entitlements.mac.plist",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Notes4Chris needs microphone access to record your voice during meetings.",
+        "NSScreenCaptureUsageDescription": "Notes4Chris needs Screen Recording permission to capture system audio during meetings."
+      }
     },
+    "extraResources": [
+      {
+        "from": "native/sck-audio-capture/.build/release/sck-audio-capture",
+        "to": "sck-audio-capture"
+      }
+    ],
     "files": [
       "**/*",
       "!**/*.md",
       "!.gitignore",
       "!_devnotes",
-      "!whisper.cpp"
+      "!whisper.cpp",
+      "!native"
     ]
   }
 }

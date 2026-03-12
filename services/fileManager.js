@@ -47,33 +47,24 @@ function cleanupOldRecordings(baseDir, retentionDays = RETENTION_DAYS) {
   const maxAge = retentionDays * MS_PER_DAY;
   const deleted = [];
 
-  try {
-    const files = fs.readdirSync(recordingsDir);
-
-    for (let file of files) {
-      // Only delete WAV files
-      if (!file.endsWith('.wav')) {
-        continue;
-      }
-
-      const filepath = path.join(recordingsDir, file);
-
-      try {
-        const stats = fs.statSync(filepath);
-        const age = now - stats.mtimeMs;
-
-        if (age > maxAge) {
-          fs.unlinkSync(filepath);
-          deleted.push(file);
-          console.log(`Deleted old recording: ${file}`);
-        }
-      } catch (err) {
-        console.error(`Failed to process file ${file}:`, err.message);
-      }
+  walkDirectory(recordingsDir, filepath => {
+    if (!filepath.endsWith('.wav')) {
+      return;
     }
-  } catch (err) {
-    console.error('Failed to cleanup recordings:', err.message);
-  }
+
+    try {
+      const stats = fs.statSync(filepath);
+      const age = now - stats.mtimeMs;
+
+      if (age > maxAge) {
+        fs.unlinkSync(filepath);
+        deleted.push(path.relative(recordingsDir, filepath));
+        console.log(`Deleted old recording: ${filepath}`);
+      }
+    } catch (err) {
+      console.error(`Failed to process file ${filepath}:`, err.message);
+    }
+  });
 
   return deleted;
 }
@@ -84,10 +75,22 @@ function cleanupOldRecordings(baseDir, retentionDays = RETENTION_DAYS) {
  * Calculates total disk usage and file counts for recordings and processed files.
  *
  * @param {string} baseDir - Base directory for the application
- * @returns {{totalSize: number, totalSizeFormatted: string, recordingCount: number, transcriptCount: number, notesCount: number}}
+ * @returns {{
+ *   totalSize: number,
+ *   totalSizeFormatted: string,
+ *   audioSize: number,
+ *   audioSizeFormatted: string,
+ *   generatedSize: number,
+ *   generatedSizeFormatted: string,
+ *   recordingCount: number,
+ *   transcriptCount: number,
+ *   notesCount: number
+ * }}
  */
 function getStorageStats(baseDir) {
   let totalSize = 0;
+  let audioSize = 0;
+  let generatedSize = 0;
   let recordingCount = 0;
   let transcriptCount = 0;
   let notesCount = 0;
@@ -95,19 +98,42 @@ function getStorageStats(baseDir) {
   const recordingsDir = path.join(baseDir, 'recordings');
   const processedDir = path.join(baseDir, 'processed');
 
-  // Count recordings
   if (fs.existsSync(recordingsDir)) {
     try {
-      const files = fs.readdirSync(recordingsDir);
-      files.forEach(file => {
-        if (file.endsWith('.wav')) {
+      const entries = fs.readdirSync(recordingsDir, { withFileTypes: true });
+
+      entries.forEach(entry => {
+        const fullPath = path.join(recordingsDir, entry.name);
+
+        if (entry.isFile() && entry.name.endsWith('.wav')) {
           try {
-            const stats = fs.statSync(path.join(recordingsDir, file));
+            const stats = fs.statSync(fullPath);
             totalSize += stats.size;
+            audioSize += stats.size;
             recordingCount++;
           } catch (err) {
             // Skip files we can't access
           }
+          return;
+        }
+
+        if (entry.isDirectory()) {
+          if (entry.name.endsWith('_session')) {
+            recordingCount++;
+          }
+
+          walkDirectory(fullPath, filepath => {
+            try {
+              const stats = fs.statSync(filepath);
+              totalSize += stats.size;
+
+              if (filepath.endsWith('.wav')) {
+                audioSize += stats.size;
+              }
+            } catch (err) {
+              // Skip files we can't access
+            }
+          });
         }
       });
     } catch (err) {
@@ -115,36 +141,64 @@ function getStorageStats(baseDir) {
     }
   }
 
-  // Count processed files
   if (fs.existsSync(processedDir)) {
-    try {
-      const files = fs.readdirSync(processedDir);
-      files.forEach(file => {
-        try {
-          const stats = fs.statSync(path.join(processedDir, file));
-          totalSize += stats.size;
+    walkDirectory(processedDir, filepath => {
+      const filename = path.basename(filepath);
 
-          if (file.endsWith('_transcript.txt')) {
-            transcriptCount++;
-          } else if (file.endsWith('_notes.md')) {
-            notesCount++;
-          }
-        } catch (err) {
-          // Skip files we can't access
+      try {
+        const stats = fs.statSync(filepath);
+        totalSize += stats.size;
+        generatedSize += stats.size;
+
+        if (filename.endsWith('_transcript.txt') || filename === 'merged_transcript.txt') {
+          transcriptCount++;
+        } else if (filename.endsWith('_notes.md') || filename === 'notes.md') {
+          notesCount++;
         }
-      });
-    } catch (err) {
-      console.error('Failed to read processed directory:', err.message);
-    }
+      } catch (err) {
+        // Skip files we can't access
+      }
+    });
   }
 
   return {
     totalSize,
     totalSizeFormatted: formatBytes(totalSize),
+    audioSize,
+    audioSizeFormatted: formatBytes(audioSize),
+    generatedSize,
+    generatedSizeFormatted: formatBytes(generatedSize),
     recordingCount,
     transcriptCount,
     notesCount
   };
+}
+
+/**
+ * Walk a directory tree and invoke a callback for each file.
+ *
+ * @param {string} dir - Directory to scan
+ * @param {(filepath: string) => void} visitor - Called for each file
+ */
+function walkDirectory(dir, visitor) {
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+
+    entries.forEach(entry => {
+      const fullPath = path.join(dir, entry.name);
+
+      if (entry.isDirectory()) {
+        walkDirectory(fullPath, visitor);
+        return;
+      }
+
+      if (entry.isFile()) {
+        visitor(fullPath);
+      }
+    });
+  } catch (err) {
+    console.error(`Failed to read directory ${dir}:`, err.message);
+  }
 }
 
 /**

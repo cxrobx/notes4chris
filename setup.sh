@@ -49,36 +49,6 @@ else
 fi
 echo ""
 
-# Check for Ollama
-echo "📦 Checking for Ollama..."
-if command -v ollama &> /dev/null; then
-  echo "✅ Ollama already installed"
-
-  # Check if llama model is available
-  echo "🔍 Checking for Ollama models..."
-  if ollama list | grep -q "llama"; then
-    echo "✅ Ollama model found"
-  else
-    echo "📥 Pulling llama3.2 model (this may take a while)..."
-    ollama pull llama3.2
-    echo "✅ llama3.2 model downloaded"
-  fi
-else
-  echo "📦 Installing Ollama..."
-  brew install ollama
-
-  echo "🚀 Starting Ollama service..."
-  brew services start ollama
-
-  # Wait for Ollama to start
-  sleep 3
-
-  echo "📥 Pulling llama3.2 model (this may take a while)..."
-  ollama pull llama3.2
-  echo "✅ Ollama and llama3.2 model installed"
-fi
-echo ""
-
 # Check for cmake (required for whisper.cpp compilation)
 echo "📦 Checking for cmake..."
 if ! command -v cmake &> /dev/null; then
@@ -149,7 +119,7 @@ echo ""
 echo "Next steps:"
 echo "  1. Configure Multi-Output Device in Audio MIDI Setup"
 echo "     (System audio → Multi-Output Device with BlackHole + Speakers)"
-echo "  2. Ensure Ollama is running: ollama serve"
+echo "  2. Install Codex CLI: npm install -g @anthropic-ai/codex"
 echo "  3. Run the app: npm start"
 echo "  4. Click the menu bar icon to start recording"
 echo ""

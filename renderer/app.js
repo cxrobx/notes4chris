@@ -1,5 +1,5 @@
 /**
- * Meeting Recorder - Renderer Process
+ * Notes4Chris - Renderer Process
  *
  * UI logic for settings window
  * Communicates with main process via IPC bridge (preload.js)
@@ -24,6 +24,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Load initial data
   await loadSettings();
   await loadDependencies();
+  await loadMicDevices();
   await loadRecordings();
   await loadStorageStats();
   await loadVersion();
@@ -36,6 +37,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Setup keyboard shortcuts
   setupKeyboardShortcuts();
+
+  // Check if a recording is already in progress
+  await checkRecordingStatus();
 });
 
 /**
@@ -55,6 +59,25 @@ async function loadSettings() {
     document.getElementById('auto-process').checked = currentSettings.autoProcess;
 
     updateRetentionLabel(currentSettings.retentionDays);
+
+    // Update recording mode toggle
+    const mode = currentSettings.recordingMode || 'dual';
+    setModeToggle(mode);
+
+    // Update speaker labels
+    if (currentSettings.systemLabel) {
+      document.getElementById('system-label').value = currentSettings.systemLabel;
+    }
+    if (currentSettings.micLabel) {
+      document.getElementById('mic-label').value = currentSettings.micLabel;
+    }
+
+    // Select mic device if saved
+    if (currentSettings.micDevice) {
+      const micSelect = document.getElementById('mic-device');
+      // Will be set after devices load
+      micSelect.dataset.savedDevice = currentSettings.micDevice;
+    }
   } catch (err) {
     console.error('Failed to load settings:', err);
     showError('Failed to load settings');
@@ -68,15 +91,60 @@ async function loadDependencies() {
 
     updateStatusIcon('status-sox', deps.sox);
     updateStatusIcon('status-whisper', deps.whisper);
-    updateStatusIcon('status-ollama', deps.ollama);
-    updateStatusIcon('status-blackhole', deps.blackhole);
-
-    // If Ollama is still checking (null), re-check after 2 seconds
-    if (deps.ollama === null) {
-      setTimeout(() => loadDependencies(), 2000);
-    }
+    updateStatusIcon('status-codex', deps.codex);
+    updateStatusIcon('status-system-audio', deps.systemAudio);
+    updateStatusIcon('status-mic', deps.mic);
   } catch (err) {
     console.error('Failed to check dependencies:', err);
+  }
+}
+
+async function loadMicDevices() {
+  const select = document.getElementById('mic-device');
+  try {
+    const devices = await api.listInputDevices();
+    console.log('Input devices:', devices);
+
+    select.innerHTML = '';
+
+    if (devices.length === 0) {
+      select.innerHTML = '<option value="">No input devices found</option>';
+      return;
+    }
+
+    // Filter out virtual/clutter devices
+    const hiddenDevices = [
+      'muse audio share', 'muse daw bridge', 'muse recording',
+      'pro tools aggregate', 'pro tools audio bridge',
+      'microsoft teams audio', 'zoomaudiodevice',
+      'loopback audio'
+    ];
+    const visibleDevices = devices.filter(d =>
+      !hiddenDevices.some(h => d.name.toLowerCase().includes(h))
+    );
+
+    // Add auto-detect option
+    const autoOption = document.createElement('option');
+    autoOption.value = '';
+    autoOption.textContent = 'Auto-detect (default microphone)';
+    select.appendChild(autoOption);
+
+    // Add each visible device
+    visibleDevices.forEach(device => {
+      const option = document.createElement('option');
+      option.value = device.name;
+      option.textContent = `${device.name} (${device.channels}ch${device.isDefault ? ', default' : ''})`;
+      select.appendChild(option);
+    });
+
+    // Restore saved selection
+    const savedDevice = select.dataset.savedDevice || currentSettings.micDevice;
+    if (savedDevice) {
+      select.value = savedDevice;
+    }
+  } catch (err) {
+    console.error('Failed to load mic devices:', err);
+    select.innerHTML = '<option value="">Failed to load devices</option>';
   }
 }
 
@@ -102,6 +170,7 @@ async function loadRecordings() {
       const deleteBtn = document.getElementById(`delete-${index}`);
       const openBtn = document.getElementById(`open-${index}`);
       const processBtn = document.getElementById(`process-${index}`);
+      const reprocessBtn = document.getElementById(`reprocess-${index}`);
 
       if (deleteBtn) {
         deleteBtn.addEventListener('click', () => handleDeleteRecording(rec.filename));
@@ -113,6 +182,10 @@ async function loadRecordings() {
 
       if (processBtn && !rec.transcribed) {
         processBtn.addEventListener('click', () => handleProcessRecording(rec.filepath));
+      }
+
+      if (reprocessBtn) {
+        reprocessBtn.addEventListener('click', () => handleReprocessSession(rec.filepath));
       }
     });
   } catch (err) {
@@ -133,6 +206,8 @@ async function loadStorageStats() {
     console.log('Storage stats:', stats);
 
     document.getElementById('stat-total-size').textContent = stats.totalSizeFormatted;
+    document.getElementById('stat-audio-size').textContent = stats.audioSizeFormatted;
+    document.getElementById('stat-generated-size').textContent = stats.generatedSizeFormatted;
     document.getElementById('stat-recordings').textContent = stats.recordingsCount;
     document.getElementById('stat-transcripts').textContent = stats.transcriptsCount;
     document.getElementById('stat-notes').textContent = stats.notesCount;
@@ -161,8 +236,11 @@ function renderRecordingItem(rec) {
   const dateStr = date.toLocaleDateString();
   const timeStr = date.toLocaleTimeString();
   const sizeStr = formatFileSize(rec.size);
-
   const index = recordings.indexOf(rec);
+
+  const dualBadge = rec.isDualTrack ? '<span class="badge badge-dual">Dual Track</span>' : '';
+  const errorBadge = rec.processingError ? `<span class="badge badge-error" title="${rec.processingError}">Failed</span>` : '';
+  const showReprocess = rec.isDualTrack && (!rec.summarised || rec.processingError);
 
   return `
     <div class="recording-item">
@@ -174,13 +252,16 @@ function renderRecordingItem(rec) {
         </div>
       </div>
       <div class="recording-badges">
+        ${dualBadge}
         ${rec.transcribed ? '<span class="badge badge-success">Transcribed</span>' : '<span class="badge badge-warning">Not transcribed</span>'}
         ${rec.summarised ? '<span class="badge badge-success">Summarised</span>' : ''}
+        ${errorBadge}
       </div>
       <div class="recording-actions">
-        <button class="icon-btn" id="open-${index}" title="Open file">📂</button>
-        ${!rec.transcribed ? `<button class="icon-btn" id="process-${index}" title="Process recording">⚙️</button>` : ''}
-        <button class="icon-btn danger" id="delete-${index}" title="Delete">🗑️</button>
+        <button class="icon-btn" id="open-${index}" title="Open file">&#x1F4C2;</button>
+        ${!rec.transcribed ? `<button class="icon-btn" id="process-${index}" title="Process recording">&#x2699;&#xFE0F;</button>` : ''}
+        ${showReprocess ? `<button class="icon-btn" id="reprocess-${index}" title="Reprocess session">&#x1F504;</button>` : ''}
+        <button class="icon-btn danger" id="delete-${index}" title="Delete">&#x1F5D1;&#xFE0F;</button>
       </div>
     </div>
   `;
@@ -190,19 +271,40 @@ function updateStatusIcon(elementId, status) {
   const element = document.getElementById(elementId);
   if (!element) return;
 
-  // Handle three states: true (available), false (unavailable), null (checking)
+  element.textContent = '';
+  element.classList.remove('is-loading', 'is-ready', 'is-error');
+
   if (status === null || status === undefined) {
-    element.textContent = '⏳';
+    element.classList.add('is-loading');
+    element.setAttribute('aria-label', 'Checking');
   } else if (status === true) {
-    element.textContent = '✅';
+    element.classList.add('is-ready');
+    element.setAttribute('aria-label', 'Available');
   } else {
-    element.textContent = '❌';
+    element.classList.add('is-error');
+    element.setAttribute('aria-label', 'Unavailable');
   }
 }
 
 function updateRetentionLabel(days) {
   const label = document.getElementById('retention-days-value');
   label.textContent = `${days} day${days !== 1 ? 's' : ''}`;
+}
+
+function setModeToggle(mode) {
+  const systemBtn = document.getElementById('mode-system');
+  const dualBtn = document.getElementById('mode-dual');
+  const micSettings = document.getElementById('mic-settings');
+
+  if (mode === 'system') {
+    systemBtn.classList.add('active');
+    dualBtn.classList.remove('active');
+    micSettings.classList.add('hidden');
+  } else {
+    systemBtn.classList.remove('active');
+    dualBtn.classList.add('active');
+    micSettings.classList.remove('hidden');
+  }
 }
 
 /**
@@ -236,8 +338,23 @@ function setupEventListeners() {
   });
 
   // Change output directory
-  document.getElementById('btn-change-dir').addEventListener('click', () => {
-    alert('Directory selection will be implemented in a future update.\nFor now, modify the setting directly in electron-store.');
+  document.getElementById('btn-change-dir').addEventListener('click', async () => {
+    const result = await api.chooseOutputDirectory();
+    if (!result) {
+      showError('Failed to open folder chooser');
+      return;
+    }
+
+    if (result.error) {
+      showError('Failed to choose folder: ' + result.error);
+      return;
+    }
+
+    if (!result || result.canceled) {
+      return;
+    }
+
+    document.getElementById('output-directory').value = result.path;
   });
 
   // Reset settings
@@ -245,12 +362,61 @@ function setupEventListeners() {
 
   // Save settings
   document.getElementById('btn-save').addEventListener('click', handleSaveSettings);
+
+  // Recording mode toggle
+  document.getElementById('mode-system').addEventListener('click', () => {
+    setModeToggle('system');
+  });
+  document.getElementById('mode-dual').addEventListener('click', () => {
+    setModeToggle('dual');
+  });
+
+  // Refresh mic devices
+  document.getElementById('btn-refresh-mics').addEventListener('click', async () => {
+    await loadMicDevices();
+    showInfo('Mic devices refreshed');
+  });
+
+  // Preflight check
+  document.getElementById('btn-preflight').addEventListener('click', runPreflightCheck);
 }
 
+let recordingTimerInterval = null;
+let recordingStartTime = null;
+
 function setupIPCListeners() {
+  // Listen for recording state changes
+  api.onRecordingUpdate((data) => {
+    const indicator = document.getElementById('recording-indicator');
+    const micMeter = document.getElementById('meter-mic');
+
+    if (data.state === 'recording') {
+      indicator.classList.remove('hidden');
+      micMeter.classList.toggle('hidden', data.mode !== 'dual');
+      recordingStartTime = data.startTime;
+      startRecordingTimer();
+    } else {
+      indicator.classList.add('hidden');
+      stopRecordingTimer();
+    }
+  });
+
+  // Listen for audio level updates
+  api.onRecordingLevels((levels) => {
+    updateMeter('system', levels.system || 0);
+    if (levels.mic !== undefined) {
+      updateMeter('mic', levels.mic || 0);
+    }
+  });
+
   // Listen for processing progress
   api.onProcessingProgress((data) => {
     showProcessingOverlay(data.stage, data.message, data.progress);
+  });
+
+  // Listen for processing complete
+  api.onProcessingComplete(() => {
+    hideProcessingOverlay();
   });
 
   // Listen for errors
@@ -263,15 +429,82 @@ function setupIPCListeners() {
   // Listen for notifications
   api.onNotification((data) => {
     console.log('Notification:', data);
-    // Show toast based on notification type
     const type = data.type || 'info';
     showToast(data.message, type);
   });
+
+  // Listen for companion mode status
+  api.onCompanionModeStatus((data) => {
+    const badge = document.getElementById('companion-badge');
+    const providerName = document.getElementById('companion-provider-name');
+    if (!badge) return;
+
+    if (data.active) {
+      if (providerName && data.provider) {
+        providerName.textContent = data.provider.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      }
+      badge.classList.remove('hidden');
+    } else {
+      badge.classList.add('hidden');
+    }
+  });
 }
 
-/**
- * Setup keyboard shortcuts
- */
+function updateMeter(track, level) {
+  const fill = document.getElementById(`meter-fill-${track}`);
+  if (!fill) return;
+
+  const percent = Math.round(level * 100);
+  fill.style.width = `${percent}%`;
+
+  // Colour thresholds: green < 65%, yellow 65-85%, red > 85%
+  fill.classList.remove('level-medium', 'level-hot');
+  if (percent > 85) {
+    fill.classList.add('level-hot');
+  } else if (percent > 65) {
+    fill.classList.add('level-medium');
+  }
+}
+
+function startRecordingTimer() {
+  stopRecordingTimer();
+  const timerEl = document.getElementById('recording-timer');
+
+  recordingTimerInterval = setInterval(() => {
+    if (!recordingStartTime) return;
+    const elapsed = Math.floor((Date.now() - recordingStartTime) / 1000);
+    const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
+    const secs = (elapsed % 60).toString().padStart(2, '0');
+    timerEl.textContent = `${mins}:${secs}`;
+  }, 1000);
+}
+
+async function checkRecordingStatus() {
+  try {
+    const status = await api.getRecordingStatus();
+    if (status && status.isRecording) {
+      const indicator = document.getElementById('recording-indicator');
+      const micMeter = document.getElementById('meter-mic');
+      indicator.classList.remove('hidden');
+      micMeter.classList.toggle('hidden', status.mode !== 'dual');
+      recordingStartTime = status.startTime;
+      startRecordingTimer();
+    }
+  } catch (err) {
+    console.error('Failed to check recording status:', err);
+  }
+}
+
+function stopRecordingTimer() {
+  if (recordingTimerInterval) {
+    clearInterval(recordingTimerInterval);
+    recordingTimerInterval = null;
+  }
+  recordingStartTime = null;
+  const timerEl = document.getElementById('recording-timer');
+  if (timerEl) timerEl.textContent = '00:00';
+}
+
 function setupKeyboardShortcuts() {
   document.addEventListener('keydown', (e) => {
     // Cmd/Ctrl + S: Save settings
@@ -294,12 +527,10 @@ function setupKeyboardShortcuts() {
       showInfo('Checking dependencies...');
     }
 
-    // Cmd/Ctrl + W: Close window (handled by Electron)
     // Escape: Close any overlays
     if (e.key === 'Escape') {
       const overlay = document.getElementById('processing-overlay');
       if (!overlay.classList.contains('hidden')) {
-        // Don't close overlay during processing
         e.preventDefault();
       }
     }
@@ -308,10 +539,17 @@ function setupKeyboardShortcuts() {
 
 async function handleSaveSettings() {
   try {
+    const activeMode = document.getElementById('mode-dual').classList.contains('active') ? 'dual' : 'system';
+    const micDevice = document.getElementById('mic-device').value || null;
+
     const newSettings = {
       outputDirectory: document.getElementById('output-directory').value,
       retentionDays: parseInt(document.getElementById('retention-days').value),
-      autoProcess: document.getElementById('auto-process').checked
+      autoProcess: document.getElementById('auto-process').checked,
+      recordingMode: activeMode,
+      micDevice: micDevice,
+      systemLabel: document.getElementById('system-label').value || 'Remote',
+      micLabel: document.getElementById('mic-label').value || 'Me'
     };
 
     const result = await api.updateSettings(newSettings);
@@ -329,7 +567,16 @@ async function handleSaveSettings() {
 }
 
 async function handleResetSettings() {
-  if (!confirm('Are you sure you want to reset all settings to defaults?')) {
+  const confirmation = await api.confirmAction({
+    title: 'Reset Settings',
+    message: 'Reset all settings to their defaults?',
+    detail: 'This will restore the default output folder, retention period, and recording preferences.',
+    confirmLabel: 'Reset',
+    cancelLabel: 'Cancel',
+    destructive: true
+  });
+
+  if (!confirmation.confirmed) {
     return;
   }
 
@@ -338,6 +585,7 @@ async function handleResetSettings() {
 
     if (result.success) {
       await loadSettings();
+      await loadMicDevices();
       showSuccess('Settings reset to defaults');
     } else {
       showError('Failed to reset settings');
@@ -349,7 +597,16 @@ async function handleResetSettings() {
 }
 
 async function handleDeleteRecording(filename) {
-  if (!confirm(`Delete recording "${filename}"?\n\nThis will also delete associated transcripts and notes.`)) {
+  const confirmation = await api.confirmAction({
+    title: 'Delete Recording',
+    message: `Delete "${filename}"?`,
+    detail: 'This will also delete the associated transcripts and notes.',
+    confirmLabel: 'Delete',
+    cancelLabel: 'Cancel',
+    destructive: true
+  });
+
+  if (!confirmation.confirmed) {
     return;
   }
 
@@ -399,10 +656,38 @@ async function handleProcessRecording(wavPath) {
   }
 }
 
+async function handleReprocessSession(sessionDir) {
+  try {
+    showProcessingOverlay('Reprocessing', 'Starting reprocessing...', 0);
+
+    const result = await api.reprocessSession(sessionDir);
+
+    if (result.success) {
+      showInfo('Reprocessing started — this may take a while for large files');
+    } else {
+      hideProcessingOverlay();
+      showError('Reprocessing failed: ' + result.error);
+    }
+  } catch (err) {
+    console.error('Failed to reprocess session:', err);
+    hideProcessingOverlay();
+    showError('Reprocessing failed');
+  }
+}
+
 async function handleCleanup() {
   const retentionDays = parseInt(document.getElementById('retention-days').value);
 
-  if (!confirm(`Delete recordings older than ${retentionDays} days?\n\nTranscripts and notes will be preserved.`)) {
+  const confirmation = await api.confirmAction({
+    title: 'Cleanup Old Recordings',
+    message: `Delete recordings older than ${retentionDays} days?`,
+    detail: 'Transcripts and notes will be preserved.',
+    confirmLabel: 'Clean Up',
+    cancelLabel: 'Cancel',
+    destructive: true
+  });
+
+  if (!confirmation.confirmed) {
     return;
   }
 
@@ -419,6 +704,36 @@ async function handleCleanup() {
   } catch (err) {
     console.error('Cleanup failed:', err);
     showError('Cleanup failed');
+  }
+}
+
+async function runPreflightCheck() {
+  const panel = document.getElementById('preflight-panel');
+  const results = document.getElementById('preflight-results');
+
+  panel.classList.remove('hidden');
+  results.innerHTML = '<div class="loading">Running preflight checks...</div>';
+
+  try {
+    const checks = await api.runPreflight();
+    console.log('Preflight results:', checks);
+
+    let html = '';
+    for (const check of checks) {
+      const icon = check.pass ? '\u2705' : '\u274C';
+      html += `<div class="preflight-item ${check.pass ? 'pass' : 'fail'}">
+        <span>${icon}</span>
+        <div>
+          <strong>${check.name}</strong>
+          <small>${check.message}</small>
+        </div>
+      </div>`;
+    }
+
+    results.innerHTML = html;
+  } catch (err) {
+    console.error('Preflight check failed:', err);
+    results.innerHTML = '<div class="preflight-item fail"><span>\u274C</span><div><strong>Preflight failed</strong><small>' + err.message + '</small></div></div>';
   }
 }
 
@@ -448,28 +763,19 @@ function hideProcessingOverlay() {
   overlay.classList.add('hidden');
 }
 
-/**
- * Show toast notification
- * @param {string} message - The message to display
- * @param {string} type - Type: 'success', 'error', 'warning', 'info'
- * @param {number} duration - Duration in ms (default: 4000)
- */
 function showToast(message, type = 'info', duration = 4000) {
   const container = document.getElementById('toast-container');
 
-  // Create toast element
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
 
-  // Icon based on type
   const icons = {
-    success: '✅',
-    error: '❌',
-    warning: '⚠️',
-    info: 'ℹ️'
+    success: '\u2705',
+    error: '\u274C',
+    warning: '\u26A0\uFE0F',
+    info: '\u2139\uFE0F'
   };
 
-  // Title based on type
   const titles = {
     success: 'Success',
     error: 'Error',
@@ -486,16 +792,13 @@ function showToast(message, type = 'info', duration = 4000) {
     <button class="toast-close">&times;</button>
   `;
 
-  // Add to container
   container.appendChild(toast);
 
-  // Close button handler
   const closeBtn = toast.querySelector('.toast-close');
   closeBtn.addEventListener('click', () => {
     removeToast(toast);
   });
 
-  // Auto-remove after duration
   setTimeout(() => {
     removeToast(toast);
   }, duration);
@@ -513,7 +816,7 @@ function showSuccess(message) {
 }
 
 function showError(message) {
-  showToast(message, 'error', 6000); // Longer duration for errors
+  showToast(message, 'error', 6000);
 }
 
 function showWarning(message) {

@@ -43,6 +43,12 @@ coverage/
 _devnotes/
 whisper.cpp/
 
+# Tool configs
+.serena/
+
+# Swift build artifacts
+native/*/.build/
+
 # Random
 .history
 CLAUDE.md

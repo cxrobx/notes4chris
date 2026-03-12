@@ -4,53 +4,159 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;">
-  <title>Meeting Recorder - Settings</title>
+  <title>Notes4Chris - Settings</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <div class="container">
-    <!-- Header -->
-    <header>
-      <h1>Meeting Recorder Settings</h1>
-      <p class="subtitle">Configure your recording and processing preferences</p>
+    <!-- Header with drag region -->
+    <header class="window-header">
+      <div class="titlebar-drag"></div>
+      <div class="hero">
+        <div class="app-mark" aria-hidden="true"></div>
+        <div class="hero-copy">
+          <span class="eyebrow">Preferences</span>
+          <h1>Notes4Chris</h1>
+          <p class="subtitle">Private meeting capture with on-device transcription and summarisation.</p>
+          <div class="hero-badges" aria-label="Product highlights">
+            <span class="hero-badge">Menu bar recorder</span>
+            <span class="hero-badge">Local-only processing</span>
+            <span class="hero-badge">Speaker-aware notes</span>
+          </div>
+        </div>
+      </div>
     </header>
+
+    <!-- Recording Indicator (visible during recording) -->
+    <div id="recording-indicator" class="recording-indicator hidden">
+      <div class="recording-header">
+        <div class="recording-dot"></div>
+        <span class="recording-label">Recording</span>
+        <span class="recording-timer" id="recording-timer">00:00</span>
+      </div>
+      <div id="companion-badge" class="companion-badge hidden">
+        Using <span id="companion-provider-name">Meeting Copilot</span> transcript
+      </div>
+      <div class="level-meters">
+        <div class="level-meter" id="meter-system">
+          <span class="meter-label">System</span>
+          <div class="meter-track">
+            <div class="meter-fill" id="meter-fill-system"></div>
+          </div>
+        </div>
+        <div class="level-meter" id="meter-mic">
+          <span class="meter-label">Mic</span>
+          <div class="meter-track">
+            <div class="meter-fill" id="meter-fill-mic"></div>
+          </div>
+        </div>
+      </div>
+    </div>
 
     <!-- Main Content -->
     <main>
       <!-- Status Section -->
       <section class="section">
-        <h2>System Status</h2>
+        <div class="section-header">
+          <h2>System Status</h2>
+          <button class="btn btn-secondary" id="btn-refresh-deps">Refresh</button>
+        </div>
         <div class="status-grid">
           <div class="status-item">
-            <span class="status-icon" id="status-sox">⏳</span>
+            <span class="status-icon is-loading" id="status-sox"></span>
             <div class="status-info">
               <strong>sox</strong>
               <small>Audio Recording</small>
             </div>
           </div>
           <div class="status-item">
-            <span class="status-icon" id="status-whisper">⏳</span>
+            <span class="status-icon is-loading" id="status-whisper"></span>
             <div class="status-info">
               <strong>whisper.cpp</strong>
               <small>Transcription</small>
             </div>
           </div>
           <div class="status-item">
-            <span class="status-icon" id="status-ollama">⏳</span>
+            <span class="status-icon is-loading" id="status-codex"></span>
             <div class="status-info">
-              <strong>Ollama</strong>
-              <small>AI Summarisation</small>
+              <strong>AI Summarisation</strong>
+              <small>Codex / Claude CLI</small>
             </div>
           </div>
           <div class="status-item">
-            <span class="status-icon" id="status-blackhole">⏳</span>
+            <span class="status-icon is-loading" id="status-system-audio"></span>
             <div class="status-info">
-              <strong>BlackHole</strong>
-              <small>System Audio</small>
+              <strong>System Audio</strong>
+              <small>ScreenCaptureKit</small>
+            </div>
+          </div>
+          <div class="status-item">
+            <span class="status-icon is-loading" id="status-mic"></span>
+            <div class="status-info">
+              <strong>Microphone</strong>
+              <small>Voice Input</small>
             </div>
           </div>
         </div>
-        <button class="btn btn-secondary" id="btn-refresh-deps">Refresh Status</button>
+      </section>
+
+      <!-- Audio Configuration -->
+      <section class="section">
+        <h2>Audio Configuration</h2>
+
+        <div class="form-group">
+          <label>
+            Recording Mode
+            <small>Choose single-track (system only) or dual-track (system + mic)</small>
+          </label>
+          <div class="mode-toggle">
+            <button class="mode-btn" id="mode-system" data-mode="system">System Only</button>
+            <button class="mode-btn active" id="mode-dual" data-mode="dual">Dual Track</button>
+          </div>
+        </div>
+
+        <div id="mic-settings">
+          <div class="form-group">
+            <label for="mic-device">
+              Microphone Device
+              <small>Select which microphone to use for voice capture</small>
+            </label>
+            <div class="input-with-button">
+              <select id="mic-device" class="select-input">
+                <option value="">Loading devices...</option>
+              </select>
+              <button class="btn btn-secondary" id="btn-refresh-mics">Refresh</button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="system-label">
+              Speaker Labels
+              <small>Labels used to identify speakers in transcripts and notes</small>
+            </label>
+            <div class="label-inputs">
+              <div class="label-input-group">
+                <span class="label-prefix">System:</span>
+                <input type="text" id="system-label" value="Remote" placeholder="Remote">
+              </div>
+              <div class="label-input-group">
+                <span class="label-prefix">Mic:</span>
+                <input type="text" id="mic-label" value="Me" placeholder="Me">
+              </div>
+            </div>
+          </div>
+
+          <div class="info-notice">
+            <strong>Tip:</strong> Use headphones during dual-track recording to prevent system audio from bleeding into your microphone track.
+          </div>
+        </div>
+
+        <div class="form-group" style="margin-top: 16px;">
+          <button class="btn btn-secondary" id="btn-preflight">Run Preflight Check</button>
+          <div id="preflight-panel" class="preflight-panel hidden">
+            <div class="preflight-results" id="preflight-results"></div>
+          </div>
+        </div>
       </section>
 
       <!-- General Settings -->
@@ -60,7 +166,7 @@
         <div class="form-group">
           <label for="output-directory">
             Output Directory
-            <small>Where recordings and notes are saved</small>
+            <small>Where recordings and internal processing files are saved</small>
           </label>
           <div class="input-with-button">
             <input type="text" id="output-directory" readonly>
@@ -70,7 +176,7 @@
 
         <div class="form-group">
           <label for="retention-days">
-            Retention Period (days)
+            Retention Period
             <small>WAV files older than this will be deleted automatically</small>
           </label>
           <div class="input-with-slider">
@@ -87,6 +193,10 @@
               <small>Automatically transcribe and generate notes after recording</small>
             </span>
           </label>
+        </div>
+
+        <div class="info-notice">
+          Meeting summaries are also exported to your Obsidian vault in <code>~/Documents/CX</code>.
         </div>
       </section>
 
@@ -106,24 +216,32 @@
       <section class="section">
         <div class="section-header">
           <h2>Storage</h2>
-          <button class="btn btn-secondary" id="btn-cleanup">Cleanup Old Files</button>
+          <button class="btn btn-secondary" id="btn-cleanup">Cleanup</button>
         </div>
 
         <div class="storage-stats">
           <div class="stat-item">
-            <span class="stat-label">Total Size:</span>
+            <span class="stat-label">Total</span>
             <span class="stat-value" id="stat-total-size">-</span>
           </div>
           <div class="stat-item">
-            <span class="stat-label">Recordings:</span>
+            <span class="stat-label">Audio</span>
+            <span class="stat-value" id="stat-audio-size">-</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">AI Output</span>
+            <span class="stat-value" id="stat-generated-size">-</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Recordings</span>
             <span class="stat-value" id="stat-recordings">-</span>
           </div>
           <div class="stat-item">
-            <span class="stat-label">Transcripts:</span>
+            <span class="stat-label">Transcripts</span>
             <span class="stat-value" id="stat-transcripts">-</span>
           </div>
           <div class="stat-item">
-            <span class="stat-label">Notes:</span>
+            <span class="stat-label">Notes</span>
             <span class="stat-value" id="stat-notes">-</span>
           </div>
         </div>
@@ -137,7 +255,7 @@
       <div class="footer-content">
         <span id="version">v1.0.0</span>
         <div class="footer-buttons">
-          <button class="btn btn-secondary" id="btn-reset-settings">Reset to Defaults</button>
+          <button class="btn btn-secondary" id="btn-reset-settings">Reset</button>
           <button class="btn btn-primary" id="btn-save">Save Changes</button>
         </div>
       </div>

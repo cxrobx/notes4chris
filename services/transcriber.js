@@ -1,6 +1,8 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { mergeTranscripts } = require('./transcriptMerger');
+const { checkForProvider, readSharedTranscript, writeCompanionOutputs } = require('./companionTranscript');
 
 /**
  * Find whisper.cpp binary
@@ -12,8 +14,12 @@ const path = require('path');
  */
 function findWhisperBinary() {
   const possiblePaths = [
-    './whisper.cpp/build/bin/whisper-cli',    // New CMake build location
-    './whisper.cpp/main',                      // Old Makefile location
+    '/opt/homebrew/bin/whisper-cpp',            // Homebrew (Apple Silicon)
+    '/opt/homebrew/bin/whisper-cli',            // Homebrew alt name
+    '/usr/local/bin/whisper-cpp',               // Homebrew (Intel)
+    '/usr/local/bin/whisper-cli',               // Homebrew alt name (Intel)
+    './whisper.cpp/build/bin/whisper-cli',      // Local CMake build
+    './whisper.cpp/main',                        // Local Makefile build
     path.join(__dirname, '../whisper.cpp/build/bin/whisper-cli'),
     path.join(__dirname, '../whisper.cpp/main'),
     '/usr/local/bin/whisper',
@@ -47,6 +53,12 @@ function findWhisperBinary() {
  */
 function findWhisperModel() {
   const possibleModels = [
+    // VoiceInk's large-v3-turbo (best quality)
+    path.join(process.env.HOME, 'Library/Application Support/com.prakashjoshipax.VoiceInk/WhisperModels/ggml-large-v3-turbo.bin'),
+    path.join(process.env.HOME, 'Library/Application Support/com.prakashjoshipax.VoiceInk/WhisperModels/ggml-large-v3-turbo-q5_0.bin'),
+    // Homebrew whisper-cpp model location
+    '/opt/homebrew/share/whisper-cpp/models/ggml-base.en.bin',
+    // Local project models
     './models/ggml-base.en.bin',
     './whisper.cpp/models/ggml-base.en.bin',
     path.join(__dirname, '../models/ggml-base.en.bin'),
@@ -77,10 +89,12 @@ function findWhisperModel() {
  * @param {string} wavPath - Path to WAV audio file
  * @param {string} outputDir - Base directory for output
  * @param {Function} [progressCallback] - Optional callback for progress updates (0-100)
+ * @param {string} [outputPrefix] - Optional output prefix (defaults to basename-derived)
+ * @param {boolean} [outputCsv=false] - Also output CSV format for merging
  * @returns {Promise<string>} Path to generated transcript file
  * @throws {Error} If transcription fails
  */
-async function transcribe(wavPath, outputDir, progressCallback) {
+async function transcribe(wavPath, outputDir, progressCallback, outputPrefix, outputCsv = false) {
   // Verify input file exists
   if (!fs.existsSync(wavPath)) {
     throw new Error(`Audio file not found: ${wavPath}`);
@@ -97,23 +111,46 @@ async function transcribe(wavPath, outputDir, progressCallback) {
   }
 
   // Generate output filename
-  const basename = path.basename(wavPath, '.wav');
-  const outputPrefix = path.join(processedDir, `${basename}_transcript`);
+  const prefix = outputPrefix || path.join(processedDir, `${path.basename(wavPath, '.wav')}_transcript`);
 
   console.log(`Starting transcription: ${wavPath}`);
-  console.log(`Output prefix: ${outputPrefix}`);
+  console.log(`Output prefix: ${prefix}`);
+
+  // Calculate timeout based on file size: 10 minutes per 20MB, minimum 5 minutes
+  const fileSizeBytes = fs.statSync(wavPath).size;
+  const fileSizeMB = fileSizeBytes / (1024 * 1024);
+  const timeoutMs = Math.max(5 * 60 * 1000, Math.ceil(fileSizeMB / 20) * 10 * 60 * 1000);
+  console.log(`Whisper timeout: ${Math.round(timeoutMs / 60000)} minutes for ${fileSizeMB.toFixed(1)} MB file`);
 
   return new Promise((resolve, reject) => {
-    // Spawn whisper.cpp process
-    const whisper = spawn(whisperBin, [
+    // Build whisper args
+    const args = [
       '-m', modelPath,        // Model file
       '-f', wavPath,          // Input audio file
       '-otxt',                // Output format: txt
-      '-of', outputPrefix,    // Output file prefix
+      '-of', prefix,          // Output file prefix
       '--print-progress',     // Print progress to stderr
       '--language', 'en',     // Language: English
-      '--threads', '4'        // Use 4 threads (adjust based on CPU)
-    ]);
+      '--threads', '4',       // Use 4 threads
+      '--processors', '2'     // Split audio into 2 chunks processed concurrently
+    ];
+
+    // Add CSV output if requested (for dual-track merging)
+    if (outputCsv) {
+      args.push('-ocsv');
+    }
+
+    const whisper = spawn(whisperBin, args);
+    let settled = false;
+
+    // Timeout: kill whisper if it takes too long
+    const timeoutHandle = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        whisper.kill('SIGKILL');
+        reject(new Error(`whisper.cpp timed out after ${Math.round(timeoutMs / 60000)} minutes (file: ${fileSizeMB.toFixed(1)} MB)`));
+      }
+    }, timeoutMs);
 
     let stderrData = '';
     let lastProgress = 0;
@@ -122,9 +159,7 @@ async function transcribe(wavPath, outputDir, progressCallback) {
     whisper.stderr.on('data', (data) => {
       stderrData += data.toString();
 
-      // Parse progress if callback provided
       if (progressCallback) {
-        // whisper.cpp outputs progress like: "progress = 42%"
         const progressMatch = stderrData.match(/progress\s*=\s*(\d+)%/);
         if (progressMatch) {
           const progress = parseInt(progressMatch[1]);
@@ -136,20 +171,23 @@ async function transcribe(wavPath, outputDir, progressCallback) {
       }
     });
 
-    // Capture stdout (may contain warnings or info)
+    // Capture stdout
     whisper.stdout.on('data', (data) => {
       console.log(`whisper stdout: ${data.toString().trim()}`);
     });
 
     // Handle completion
     whisper.on('close', (code) => {
+      clearTimeout(timeoutHandle);
+      if (settled) return;
+      settled = true;
+
       if (code === 0) {
-        const transcriptPath = `${outputPrefix}.txt`;
+        const transcriptPath = `${prefix}.txt`;
 
         if (fs.existsSync(transcriptPath)) {
           console.log(`Transcription complete: ${transcriptPath}`);
 
-          // Verify file has content
           const stats = fs.statSync(transcriptPath);
           if (stats.size === 0) {
             reject(new Error('Transcript file is empty. Audio may be silent or corrupted.'));
@@ -167,21 +205,164 @@ async function transcribe(wavPath, outputDir, progressCallback) {
 
     // Handle errors
     whisper.on('error', (err) => {
+      clearTimeout(timeoutHandle);
+      if (settled) return;
+      settled = true;
       reject(new Error(`Failed to start whisper.cpp: ${err.message}`));
     });
   });
 }
 
 /**
- * Get estimated transcription time
+ * Transcribe a dual-track session
  *
- * Based on ~5x real-time processing speed for base.en model on Apple Silicon.
+ * Transcribes both system and mic tracks, then merges them into
+ * a speaker-labeled transcript.
+ *
+ * @param {string} sessionDir - Path to session directory (containing manifest.json)
+ * @param {string} outputDir - Base output directory
+ * @param {Function} [progressCallback] - Optional callback with progress (0-100)
+ * @returns {Promise<{systemTranscript: string|null, micTranscript: string|null, mergedTranscript: string}>}
+ */
+async function transcribeSession(sessionDir, outputDir, progressCallback, options = {}) {
+  // Read manifest
+  const manifestPath = path.join(sessionDir, 'manifest.json');
+  if (!fs.existsSync(manifestPath)) {
+    throw new Error(`Session manifest not found: ${manifestPath}`);
+  }
+
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+  const sessionId = manifest.sessionId;
+
+  // Create processed directory for this session
+  const processedDir = path.join(outputDir, 'processed', `${sessionId}_session`);
+  if (!fs.existsSync(processedDir)) {
+    fs.mkdirSync(processedDir, { recursive: true });
+  }
+
+  // Companion mode check — use shared transcript from meeting-copilot if available
+  const useShared = options.useSharedTranscript !== false;
+  if (useShared) {
+    const provider = checkForProvider();
+    if (provider) {
+      const segments = readSharedTranscript(provider.transcriptFile);
+      if (segments.length > 0) {
+        // Log segment count and time range for visibility, especially in late-start scenarios
+        // where meeting-copilot started after notes4chris (partial transcript)
+        const earliest = Math.min(...segments.map(s => s.timestamp));
+        const latest = Math.max(...segments.map(s => s.timestamp + (s.duration || 10)));
+        console.log(`[Transcriber] Companion mode — using ${segments.length} segments from ${provider.app} (${Math.round(earliest)}s – ${Math.round(latest)}s)`);
+
+        writeCompanionOutputs(segments, processedDir);
+
+        // Update manifest with companion source
+        if (!manifest.processing) manifest.processing = {};
+        if (!manifest.processing.transcription) manifest.processing.transcription = {};
+        manifest.processing.transcription.system = path.join(processedDir, 'system_transcript.csv');
+        manifest.processing.transcription.mic = path.join(processedDir, 'mic_transcript.csv');
+        manifest.processing.transcription.merged = path.join(processedDir, 'merged_transcript.txt');
+        manifest.processing.transcription.source = `companion:${provider.app}`;
+        fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf-8');
+
+        if (progressCallback) progressCallback(100);
+
+        return {
+          systemTranscript: manifest.processing.transcription.system,
+          micTranscript: manifest.processing.transcription.mic,
+          mergedTranscript: manifest.processing.transcription.merged
+        };
+      }
+      console.log('[Transcriber] Companion transcript empty, falling back to whisper');
+    }
+  }
+
+  let systemTranscript = null;
+  let micTranscript = null;
+  let systemCsvPath = null;
+  let micCsvPath = null;
+
+  // Transcribe both tracks in parallel (0-90% progress)
+  // Each track reports its own progress; we report max(system, mic) capped at 90%
+  let systemProgress = 0;
+  let micProgress = 0;
+  const reportProgress = () => {
+    if (progressCallback) {
+      const combined = Math.round(Math.max(systemProgress, micProgress) * 0.9);
+      progressCallback(combined);
+    }
+  };
+
+  const systemPromise = manifest.tracks.system.status === 'complete'
+    ? (async () => {
+        const systemWav = path.join(sessionDir, manifest.tracks.system.file);
+        const systemPrefix = path.join(processedDir, 'system_transcript');
+        console.log('Transcribing system track...');
+        systemTranscript = await transcribe(systemWav, outputDir, (p) => {
+          systemProgress = p;
+          reportProgress();
+        }, systemPrefix, true);
+        systemCsvPath = `${systemPrefix}.csv`;
+        manifest.processing.transcription.system = systemTranscript;
+      })()
+    : Promise.resolve();
+
+  const micPromise = manifest.tracks.mic.status === 'complete'
+    ? (async () => {
+        const micWav = path.join(sessionDir, manifest.tracks.mic.file);
+        const micPrefix = path.join(processedDir, 'mic_transcript');
+        console.log('Transcribing mic track...');
+        micTranscript = await transcribe(micWav, outputDir, (p) => {
+          micProgress = p;
+          reportProgress();
+        }, micPrefix, true);
+        micCsvPath = `${micPrefix}.csv`;
+        manifest.processing.transcription.mic = micTranscript;
+      })()
+    : Promise.resolve();
+
+  const results = await Promise.allSettled([systemPromise, micPromise]);
+
+  if (results[0].status === 'rejected') {
+    console.error('System track transcription failed:', results[0].reason.message);
+  }
+  if (results[1].status === 'rejected') {
+    console.error('Mic track transcription failed:', results[1].reason.message);
+  }
+
+  // Merge transcripts (90-100% progress)
+  if (progressCallback) progressCallback(90);
+  console.log('Merging transcripts...');
+
+  const mergedPath = path.join(processedDir, 'merged_transcript.txt');
+  const systemLabel = manifest.tracks.system.label || 'Remote';
+  const micLabel = manifest.tracks.mic.label || 'Me';
+
+  try {
+    mergeTranscripts(systemCsvPath, micCsvPath, mergedPath, systemLabel, micLabel);
+  } catch (mergeErr) {
+    throw new Error(`Failed to merge transcripts: ${mergeErr.message}`);
+  }
+  manifest.processing.transcription.merged = mergedPath;
+
+  // Update manifest
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf-8');
+
+  if (progressCallback) progressCallback(100);
+
+  return {
+    systemTranscript,
+    micTranscript,
+    mergedTranscript: mergedPath
+  };
+}
+
+/**
+ * Get estimated transcription time
  *
  * @param {number} audioDurationMs - Audio duration in milliseconds
  * @returns {number} Estimated transcription time in milliseconds
  */
 function estimateTranscriptionTime(audioDurationMs) {
-  // Whisper processes at approximately 5x real-time on M1/M2
   return Math.ceil(audioDurationMs / 5);
 }
 
@@ -218,6 +399,7 @@ function verifyInstallation() {
 
 module.exports = {
   transcribe,
+  transcribeSession,
   findWhisperBinary,
   findWhisperModel,
   estimateTranscriptionTime,

@@ -1,28 +1,65 @@
 const { app, Tray, Menu, BrowserWindow, shell, nativeImage, Notification, dialog, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const Store = require('electron-store');
 const { execSync } = require('child_process');
 
-const Recorder = require('./services/recorder');
-const { transcribe, verifyInstallation: verifyWhisper } = require('./services/transcriber');
-const { generateNotes, checkOllamaHealth } = require('./services/summariser');
+// Suppress EPIPE errors on stdout/stderr when launched from Finder (no terminal attached)
+process.stdout.on('error', (err) => { if (err.code !== 'EPIPE') throw err; });
+process.stderr.on('error', (err) => { if (err.code !== 'EPIPE') throw err; });
+
+// Ensure homebrew paths are available (packaged .app has minimal PATH)
+const EXTRA_PATHS = [
+  '/opt/homebrew/bin', '/opt/homebrew/sbin', '/usr/local/bin',
+  path.join(os.homedir(), '.nvm/versions/node/v24.11.1/bin'),  // nvm-installed globals (codex)
+  path.join(os.homedir(), '.local/bin'),                        // claude CLI
+];
+const missingPaths = EXTRA_PATHS.filter(p => !(process.env.PATH || '').includes(p));
+if (missingPaths.length) {
+  process.env.PATH = missingPaths.join(':') + ':' + (process.env.PATH || '');
+}
+console.log('PATH:', process.env.PATH);
+
+const { Recorder, DualTrackRecorder } = require('./services/recorder');
+const { LevelMonitor } = require('./services/levelMonitor');
+const { transcribe, transcribeSession, verifyInstallation: verifyWhisper } = require('./services/transcriber');
+const { generateNotes, generateSessionNotes, exportNotesToObsidian, isCodexAvailable, isClaudeAvailable } = require('./services/summariser');
 const { ensureDirectoryStructure, cleanupOldRecordings, getStorageStats } = require('./services/fileManager');
+const { listInputDevices, findDefaultMicrophone, verifyInputDevice, findBlackHoleDevice, checkSckAvailable } = require('./utils/audioDevices');
+const { checkForProvider } = require('./services/companionTranscript');
+
+const OBSIDIAN_VAULT_DIRECTORY = path.join(app.getPath('documents'), 'CX');
 
 // Persistent config store
 const store = new Store({
   defaults: {
-    outputDirectory: path.join(app.getPath('documents'), 'MeetingRecordings'),
+    outputDirectory: path.join(app.getPath('documents'), 'Notes4ChrisRecordings'),
     retentionDays: 7,
-    autoProcess: true  // Automatically transcribe and generate notes after recording
+    autoProcess: true,
+    recordingMode: 'dual',
+    micDevice: null,
+    systemLabel: 'Remote',
+    micLabel: 'Me',
+    meetingContext: {
+      title: '',
+      participants: '',
+      agenda: ''
+    },
+    useSharedTranscript: true
   }
 });
 
 let tray = null;
 let settingsWindow = null;
+let preRecordWindow = null;
 let recorder = null;
+let dualRecorder = null;
 let currentRecordingPath = null;
 let statusUpdateInterval = null;
+let levelMonitor = null;
+let trayIcon = null;
+let latestLevels = { system: 0, mic: 0 };
 
 // Track active processes for cleanup
 const activeProcesses = new Set();
@@ -31,9 +68,56 @@ const activeProcesses = new Set();
 let dependenciesStatus = {
   sox: false,
   whisper: false,
-  ollama: false,
+  codex: false,
+  mic: false,
+  systemAudio: false,
   lastChecked: null
 };
+
+/**
+ * Export generated notes to the configured Obsidian vault.
+ */
+function exportNotesToVault(notesPath, options = {}) {
+  return exportNotesToObsidian(notesPath, OBSIDIAN_VAULT_DIRECTORY, options);
+}
+
+/**
+ * Build a readable note title for flat transcript/note files.
+ */
+function buildSingleTrackNoteTitle(filepath) {
+  return path.basename(filepath, path.extname(filepath))
+    .replace(/_transcript$/i, '')
+    .replace(/_notes$/i, '')
+    .trim() || 'Meeting summary';
+}
+
+/**
+ * Use meeting context when available, otherwise fall back to a generic title.
+ */
+function buildSessionNoteTitle(manifest) {
+  return (manifest.meetingContext && manifest.meetingContext.title) || 'Meeting summary';
+}
+
+/**
+ * Best-effort capture of when a single-track artefact was created.
+ */
+function getFileStartTime(filepath) {
+  try {
+    return fs.statSync(filepath).birthtime.toISOString();
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * Resolve path to the sck-audio-capture binary
+ */
+function getSckBinaryPath() {
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, 'sck-audio-capture');
+  }
+  return path.join(__dirname, 'native', 'sck-audio-capture', '.build', 'release', 'sck-audio-capture');
+}
 
 /**
  * Register a child process for cleanup on app exit
@@ -52,7 +136,8 @@ function checkDependencies() {
   const status = {
     sox: false,
     whisper: false,
-    ollama: null, // null = checking, true = available, false = unavailable
+    codex: false,
+    mic: false,
     lastChecked: Date.now()
   };
 
@@ -60,20 +145,10 @@ function checkDependencies() {
   console.log('Checking sox...');
   try {
     const soxPath = execSync('which sox', { encoding: 'utf-8' }).trim();
-    console.log(`✅ sox found at: ${soxPath}`);
-
-    // Also check version
-    try {
-      const soxVersion = execSync('sox --version', { encoding: 'utf-8' });
-      console.log(`   Version: ${soxVersion.split('\n')[0]}`);
-    } catch (e) {
-      // Version check failed, but sox exists
-    }
-
+    console.log(`sox found at: ${soxPath}`);
     status.sox = true;
   } catch (err) {
-    console.log('❌ sox not found in PATH');
-    console.log('   Run: brew install sox');
+    console.log('sox not found in PATH');
   }
 
   // Check whisper.cpp
@@ -83,37 +158,71 @@ function checkDependencies() {
     status.whisper = whisperCheck.installed;
 
     if (whisperCheck.installed) {
-      console.log(`✅ whisper binary found at: ${whisperCheck.binaryPath}`);
-      console.log(`✅ whisper model found at: ${whisperCheck.modelPath}`);
+      console.log(`whisper binary found at: ${whisperCheck.binaryPath}`);
+      console.log(`whisper model found at: ${whisperCheck.modelPath}`);
     } else {
-      console.log('❌ whisper.cpp not found');
-      console.log(`   Error: ${whisperCheck.error}`);
+      console.log(`whisper.cpp not found: ${whisperCheck.error}`);
     }
   } catch (err) {
-    console.log('❌ whisper.cpp check failed:', err.message);
+    console.log('whisper.cpp check failed:', err.message);
     status.whisper = false;
   }
 
-  // Check Ollama (async)
-  console.log('\nChecking Ollama...');
-  checkOllamaHealth()
-    .then(() => {
-      console.log('✅ Ollama is running and models available');
-      status.ollama = true;
-      dependenciesStatus.ollama = true;
-      updateTrayMenu(); // Update menu when async check completes
-    })
-    .catch((err) => {
-      console.log('❌ Ollama check failed:', err.message);
-      status.ollama = false;
-      dependenciesStatus.ollama = false;
-      updateTrayMenu(); // Update menu when async check completes
-    });
+  // Check system audio capture (SCK or BlackHole)
+  console.log('\nChecking system audio capture...');
+  const sckPath = getSckBinaryPath();
+  const sckStatus = checkSckAvailable(sckPath);
+  let blackholeOk = false;
+  try {
+    findBlackHoleDevice();
+    blackholeOk = true;
+  } catch (err) {
+    blackholeOk = false;
+  }
+  // SCK doesn't need sox; BlackHole fallback does
+  status.systemAudio = (sckStatus.available && sckStatus.permitted) || (blackholeOk && status.sox);
+  if (sckStatus.available && sckStatus.permitted) {
+    console.log('System audio: ScreenCaptureKit available and permitted');
+  } else if (blackholeOk && status.sox) {
+    console.log('System audio: BlackHole + sox available (SCK fallback)');
+  } else {
+    console.log('System audio: no capture method available');
+    if (blackholeOk && !status.sox) {
+      console.log('  (BlackHole detected but sox is missing)');
+    }
+  }
+
+  // Check microphone availability
+  console.log('\nChecking microphone...');
+  const mode = store.get('recordingMode');
+  if (mode === 'dual') {
+    const micDevice = store.get('micDevice');
+    if (micDevice) {
+      status.mic = verifyInputDevice(micDevice);
+      console.log(`Mic device "${micDevice}": ${status.mic ? 'available' : 'not found'}`);
+    } else {
+      const defaultMic = findDefaultMicrophone();
+      status.mic = defaultMic !== null;
+      console.log(`Default mic: ${defaultMic ? defaultMic.name : 'none found'}`);
+    }
+  } else {
+    status.mic = true; // Not needed in system-only mode
+  }
+
+  // Check AI summarisation (Codex or Claude CLI)
+  console.log('\nChecking AI summarisation...');
+  const codexOk = isCodexAvailable();
+  const claudeOk = isClaudeAvailable();
+  status.codex = codexOk || claudeOk;
+  const provider = codexOk ? 'Codex' : claudeOk ? 'Claude' : 'none';
+  console.log(`AI summarisation: ${status.codex ? `available (${provider})` : 'not found'}`);
 
   console.log('\n=== Dependency Check Summary ===');
-  console.log(`sox:     ${status.sox ? '✅' : '❌'}`);
-  console.log(`whisper: ${status.whisper ? '✅' : '❌'}`);
-  console.log(`ollama:  ${status.ollama === null ? '⏳ checking...' : (status.ollama ? '✅' : '❌')}`);
+  console.log(`sox:          ${status.sox ? 'OK' : 'MISSING'}`);
+  console.log(`system audio: ${status.systemAudio ? 'OK' : 'MISSING'}`);
+  console.log(`whisper:      ${status.whisper ? 'OK' : 'MISSING'}`);
+  console.log(`ai summary:   ${status.codex ? 'OK' : 'MISSING'}`);
+  console.log(`mic:          ${status.mic ? 'OK' : 'MISSING'}`);
   console.log('================================\n');
 
   dependenciesStatus = status;
@@ -130,40 +239,76 @@ function showNotification(title, body, isError = false) {
       body: body,
       silent: false
     }).show();
-  } else {
-    // Fallback to dialog
-    if (isError) {
-      dialog.showErrorBox(title, body);
-    }
+  } else if (isError) {
+    dialog.showErrorBox(title, body);
   }
 }
 
 /**
- * Initialize recorder instance
+ * Resolve the mic device name to use
+ */
+function resolveMicDevice() {
+  const savedDevice = store.get('micDevice');
+  if (savedDevice) {
+    if (verifyInputDevice(savedDevice)) {
+      return savedDevice;
+    }
+    console.warn(`Saved mic device "${savedDevice}" not available (disconnected?), falling back to default`);
+  }
+
+  const defaultMic = findDefaultMicrophone();
+  if (defaultMic) {
+    console.log(`Using default microphone: ${defaultMic.name}`);
+    return defaultMic.name;
+  }
+
+  return null;
+}
+
+/**
+ * Initialize recorder instances
  */
 function initRecorder() {
   const outputDir = store.get('outputDirectory');
   ensureDirectoryStructure(outputDir);
-  recorder = new Recorder(outputDir);
+
+  const sckBinaryPath = getSckBinaryPath();
+
+  // Always create single-track recorder as fallback
+  recorder = new Recorder(outputDir, sckBinaryPath);
   console.log(`Recorder initialized with output directory: ${outputDir}`);
+
+  // Create dual-track recorder if mode is dual
+  const mode = store.get('recordingMode');
+  if (mode === 'dual') {
+    const micDevice = resolveMicDevice();
+    if (micDevice) {
+      const systemLabel = store.get('systemLabel');
+      const micLabel = store.get('micLabel');
+      const meetingContext = store.get('meetingContext') || {};
+      dualRecorder = new DualTrackRecorder(outputDir, micDevice, systemLabel, micLabel, sckBinaryPath, meetingContext);
+      console.log(`DualTrackRecorder initialized with mic: ${micDevice}`);
+    } else {
+      console.warn('No mic device available - dual mode will fall back to system-only');
+      dualRecorder = null;
+    }
+  } else {
+    dualRecorder = null;
+  }
 }
 
 /**
  * Create menu bar tray icon
  */
 function createTray() {
-  // Create a minimal transparent PNG for the tray icon base
-  const transparentPng = Buffer.from(
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-    'base64'
-  );
+  const iconPath = path.join(__dirname, 'assets', 'icon.png');
+  trayIcon = nativeImage.createFromPath(iconPath).resize({
+    height: process.platform === 'darwin' ? 18 : 18
+  });
+  trayIcon.setTemplateImage(false);
 
-  const icon = nativeImage.createFromBuffer(transparentPng);
-  tray = new Tray(icon);
-
-  // Use emoji as the visible icon (works reliably on macOS)
-  tray.setTitle('🤖✏️');
-  tray.setToolTip('Notes4Me');
+  tray = new Tray(trayIcon);
+  tray.setToolTip('Notes4Chris');
 
   updateTrayMenu();
 }
@@ -172,51 +317,54 @@ function createTray() {
  * Create or show settings window
  */
 function openSettingsWindow() {
-  // If window already exists, focus it
   if (settingsWindow && !settingsWindow.isDestroyed()) {
     settingsWindow.focus();
     return;
   }
 
-  // Create new window
   settingsWindow = new BrowserWindow({
-    width: 900,
-    height: 700,
-    minWidth: 700,
-    minHeight: 500,
-    title: 'Meeting Recorder - Settings',
+    width: 940,
+    height: 780,
+    minWidth: 760,
+    minHeight: 560,
+    title: 'Notes4Chris',
+    titleBarStyle: 'hiddenInset',
+    hasShadow: true,
+    backgroundColor: '#000000',
+    visualEffectState: 'active',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true
     },
-    show: false  // Show after ready to prevent visual flash
+    show: false
   });
 
+  settingsWindow.webContents.session.clearCache();
   settingsWindow.loadFile('renderer/index.html');
 
-  // Show when ready
   settingsWindow.once('ready-to-show', () => {
     settingsWindow.show();
   });
 
-  // Clean up reference when closed
   settingsWindow.on('closed', () => {
     settingsWindow = null;
   });
-
-  // Open DevTools in development (optional)
-  // settingsWindow.webContents.openDevTools();
 }
 
 /**
  * Update tray menu based on recording state
  */
 function updateTrayMenu() {
-  const isRecording = recorder && recorder.isRecording;
-  const status = recorder ? recorder.getStatus() : null;
-  const canRecord = dependenciesStatus.sox;
+  const mode = store.get('recordingMode');
+  const isDualMode = mode === 'dual' && dualRecorder;
+  const activeRecorder = isDualMode ? dualRecorder : recorder;
+  const isRecording = activeRecorder && activeRecorder.isRecording;
+  const status = activeRecorder ? activeRecorder.getStatus() : null;
+  const canRecord = dependenciesStatus.systemAudio;
+
+  const modeLabel = isDualMode ? 'Dual Track' : 'System Only';
 
   const menuTemplate = [
     {
@@ -225,7 +373,9 @@ function updateTrayMenu() {
       enabled: isRecording || canRecord
     },
     {
-      label: isRecording ? `Recording: ${formatDuration(status.duration)}` : (canRecord ? 'Ready to record' : '⚠️ Dependencies missing'),
+      label: isRecording
+        ? `Recording (${modeLabel}): ${formatDuration(status.duration)}`
+        : (canRecord ? `Ready (${modeLabel})` : 'Dependencies missing'),
       enabled: false
     },
     { type: 'separator' },
@@ -252,7 +402,7 @@ function updateTrayMenu() {
     },
     { type: 'separator' },
     {
-      label: '🔄 Refresh Dependencies',
+      label: 'Refresh Dependencies',
       click: () => {
         checkDependencies();
         setTimeout(() => {
@@ -294,21 +444,77 @@ function updateTrayMenu() {
  * Start recording handler
  */
 function handleStartRecording() {
+  showPreRecordPopup();
+}
+
+/**
+ * Show pre-record popup for meeting context, then start recording
+ */
+function showPreRecordPopup() {
+  if (preRecordWindow && !preRecordWindow.isDestroyed()) {
+    preRecordWindow.focus();
+    return;
+  }
+
+  preRecordWindow = new BrowserWindow({
+    width: 460,
+    height: 470,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    alwaysOnTop: true,
+    titleBarStyle: 'hiddenInset',
+    backgroundColor: '#000000',
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload-prerecord.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true
+    }
+  });
+
+  preRecordWindow.loadFile(path.join(__dirname, 'renderer', 'pre-record.html'));
+  preRecordWindow.once('ready-to-show', () => {
+    preRecordWindow.show();
+    preRecordWindow.focus();
+    app.dock.show();  // Ensure app appears in dock so it can take focus
+  });
+  preRecordWindow.on('closed', () => { preRecordWindow = null; });
+}
+
+/**
+ * Actually start the recording after context is collected
+ */
+function startRecordingWithContext(meetingContext) {
+  // Save context for next time
+  store.set('meetingContext', meetingContext);
+
+  // Reinitialize recorder so it picks up the new context
+  initRecorder();
+
+  const mode = store.get('recordingMode');
+  const useDual = mode === 'dual' && dualRecorder;
+
   try {
-    const result = recorder.start((warning) => {
-      console.warn(warning);
-      // TODO: Show notification in Phase 5
-    });
+    if (useDual) {
+      // Dual-track mode
+      const result = dualRecorder.start((warning) => {
+        console.warn(warning);
+      });
+      console.log(`Dual recording started in: ${result.sessionDir}`);
+    } else {
+      // System-only mode
+      const result = recorder.start((warning) => {
+        console.warn(warning);
+      });
+      currentRecordingPath = result.filepath;
+      console.log(`Recording started: ${currentRecordingPath}`);
+    }
 
-    currentRecordingPath = result.filepath;
-    console.log(`Recording started: ${currentRecordingPath}`);
-
-    // Update tray icon to recording state
-    tray.setTitle('🤖🔴');
-
-    // Update menu every second to show elapsed time
     statusUpdateInterval = setInterval(() => {
-      if (!recorder.isRecording) {
+      const activeRecorder = useDual ? dualRecorder : recorder;
+      if (!activeRecorder.isRecording) {
         clearInterval(statusUpdateInterval);
         statusUpdateInterval = null;
       } else {
@@ -318,14 +524,39 @@ function handleStartRecording() {
 
     updateTrayMenu();
 
+    // Start audio level monitoring
+    startLevelMonitor(useDual);
+
+    // Check for companion transcript provider
+    let companionProvider = null;
+    if (store.get('useSharedTranscript') !== false) {
+      companionProvider = checkForProvider();
+      if (companionProvider) {
+        console.log(`[Companion] Detected provider: ${companionProvider.app}`);
+      }
+    }
+
+    // Notify settings window that recording started
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      settingsWindow.webContents.send('recording:update', {
+        state: 'recording',
+        mode: useDual ? 'dual' : 'system',
+        startTime: Date.now()
+      });
+      if (companionProvider) {
+        settingsWindow.webContents.send('companion-mode-status', {
+          active: true,
+          provider: companionProvider.app
+        });
+      }
+    }
+
   } catch (err) {
     console.error('Failed to start recording:', err);
 
-    // Show user-friendly notification
-    const errorMessage = err.message.split('\n')[0]; // First line only
+    const errorMessage = err.message.split('\n')[0];
     showNotification('Cannot Start Recording', errorMessage, true);
 
-    // If sox is missing, show setup instructions
     if (err.message.includes('sox')) {
       setTimeout(() => {
         const response = dialog.showMessageBoxSync({
@@ -351,28 +582,71 @@ function handleStartRecording() {
  * Stop recording handler
  */
 async function handleStopRecording() {
+  const mode = store.get('recordingMode');
+  const useDual = mode === 'dual' && dualRecorder && dualRecorder.isRecording;
+
   try {
-    const result = await recorder.stop();
+    stopLevelMonitor();
 
-    console.log(`Recording stopped: ${result.filepath}`);
-    console.log(`Duration: ${formatDuration(result.duration)}`);
-    console.log(`Size: ${(result.size / (1024 * 1024)).toFixed(2)} MB`);
+    if (useDual) {
+      const result = await dualRecorder.stop();
 
-    // Reset tray icon to idle state
-    tray.setTitle('🤖✏️');
+      console.log(`Dual recording stopped: ${result.sessionDir}`);
+      console.log(`Duration: ${formatDuration(result.duration)}`);
+      console.log(`System: ${(result.systemSize / (1024 * 1024)).toFixed(2)} MB`);
+      console.log(`Mic: ${(result.micSize / (1024 * 1024)).toFixed(2)} MB`);
 
-    // Clear status update interval
-    if (statusUpdateInterval) {
-      clearInterval(statusUpdateInterval);
-      statusUpdateInterval = null;
-    }
+      if (statusUpdateInterval) {
+        clearInterval(statusUpdateInterval);
+        statusUpdateInterval = null;
+      }
 
-    updateTrayMenu();
+      updateTrayMenu();
 
-    // Start processing pipeline if auto-process is enabled
-    const autoProcess = store.get('autoProcess');
-    if (autoProcess) {
-      processRecording(result.filepath, result.duration);
+      // Notify settings window
+      if (settingsWindow && !settingsWindow.isDestroyed()) {
+        settingsWindow.webContents.send('recording:update', { state: 'stopped' });
+        settingsWindow.webContents.send('companion-mode-status', { active: false });
+      }
+
+      // Process session if auto-process is enabled
+      const autoProcess = store.get('autoProcess');
+      if (autoProcess) {
+        processSession(result.sessionDir, result.duration).catch(err => {
+          console.error('Auto-processing session failed (tray):', err);
+          showNotification('Processing Error', `Failed: ${err.message.split('\n')[0]}`, true);
+          if (settingsWindow && !settingsWindow.isDestroyed()) {
+            settingsWindow.webContents.send('processing:complete', { error: err.message });
+          }
+        });
+      }
+    } else {
+      const result = await recorder.stop();
+
+      console.log(`Recording stopped: ${result.filepath}`);
+      console.log(`Duration: ${formatDuration(result.duration)}`);
+      console.log(`Size: ${(result.size / (1024 * 1024)).toFixed(2)} MB`);
+
+      if (statusUpdateInterval) {
+        clearInterval(statusUpdateInterval);
+        statusUpdateInterval = null;
+      }
+
+      updateTrayMenu();
+
+      // Notify settings window
+      if (settingsWindow && !settingsWindow.isDestroyed()) {
+        settingsWindow.webContents.send('recording:update', { state: 'stopped' });
+        settingsWindow.webContents.send('companion-mode-status', { active: false });
+      }
+
+      const autoProcess = store.get('autoProcess');
+      if (autoProcess) {
+        processRecording(result.filepath, result.duration).catch(err => {
+          console.error('Auto-processing recording failed (tray):', err);
+          showNotification('Processing Error', `Failed: ${err.message.split('\n')[0]}`, true);
+        });
+      }
     }
 
   } catch (err) {
@@ -381,64 +655,246 @@ async function handleStopRecording() {
 }
 
 /**
- * Process recording: transcribe audio and generate meeting notes
- *
- * Complete pipeline: WAV → Transcript → Meeting Notes
- *
- * @param {string} wavPath - Path to recording file
- * @param {number} duration - Recording duration in ms
+ * Convert a 0-1 level to a block character for menu bar display
+ */
+const LEVEL_BLOCKS = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+function levelToBar(level) {
+  const idx = Math.min(LEVEL_BLOCKS.length - 1, Math.round(level * (LEVEL_BLOCKS.length - 1)));
+  return LEVEL_BLOCKS[idx];
+}
+
+/**
+ * Start polling WAV files for audio levels and sending to the settings window + tray
+ */
+function startLevelMonitor(isDual) {
+  stopLevelMonitor();
+
+  levelMonitor = new LevelMonitor((levels) => {
+    // Store latest levels for tray menu display
+    latestLevels = levels;
+
+    // Send to settings window
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      settingsWindow.webContents.send('recording:levels', levels);
+    }
+
+    // Show live levels in the menu bar next to the tray icon
+    const sysBar = levelToBar(levels.system || 0);
+    if (isDual) {
+      const micBar = levelToBar(levels.mic || 0);
+      tray.setTitle(`S${sysBar} M${micBar}`);
+    } else {
+      tray.setTitle(`S${sysBar}`);
+    }
+  });
+
+  if (isDual && dualRecorder) {
+    levelMonitor.addTrack('system', dualRecorder.systemFile);
+    levelMonitor.addTrack('mic', dualRecorder.micFile);
+  } else if (recorder && recorder.currentFile) {
+    levelMonitor.addTrack('system', recorder.currentFile);
+  }
+
+  levelMonitor.start();
+}
+
+/**
+ * Stop the audio level monitor
+ */
+function stopLevelMonitor() {
+  if (levelMonitor) {
+    levelMonitor.stop();
+    levelMonitor = null;
+  }
+  if (tray) {
+    tray.setTitle('');
+  }
+}
+
+/**
+ * Process a single-track recording: transcribe audio and generate meeting notes
  */
 async function processRecording(wavPath, duration) {
   const outputDir = store.get('outputDirectory');
 
   try {
-    // Step 1: Transcribe audio
     tray.setToolTip('Transcribing audio...');
     console.log(`Starting transcription for: ${wavPath}`);
-    console.log(`Estimated time: ${formatDuration(duration / 5)} (at ~5x real-time)`);
 
     const transcriptPath = await transcribe(wavPath, outputDir, (progress) => {
       tray.setToolTip(`Transcribing: ${progress}%`);
-      console.log(`Transcription progress: ${progress}%`);
-    });
-
-    console.log(`✅ Transcription complete: ${transcriptPath}`);
-
-    // Step 2: Generate meeting notes
-    tray.setToolTip('Generating notes...');
-    console.log(`Starting note generation from: ${transcriptPath}`);
-
-    const notesPath = await generateNotes(transcriptPath, (bytesWritten) => {
-      // Optional progress tracking
-      if (bytesWritten % 100 === 0) {  // Log every 100 bytes
-        tray.setToolTip(`Generating notes... (${Math.floor(bytesWritten / 100)} chars)`);
+      if (settingsWindow && !settingsWindow.isDestroyed()) {
+        settingsWindow.webContents.send('processing:progress', {
+          stage: 'Transcribing',
+          progress,
+          message: `Processing audio: ${progress}%`
+        });
       }
     });
 
-    console.log(`✅ Note generation complete: ${notesPath}`);
+    console.log(`Transcription complete: ${transcriptPath}`);
 
-    // Reset tooltip
-    tray.setToolTip('Notes4Me');
+    tray.setToolTip('Generating notes...');
+    console.log(`Starting note generation from: ${transcriptPath}`);
 
-    // Show completion notification
-    console.log('🎉 Processing complete! Transcript and notes are ready.');
-    tray.displayBalloon({
-      title: 'Processing Complete',
-      content: 'Meeting notes generated successfully!'
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      settingsWindow.webContents.send('processing:progress', {
+        stage: 'Summarising',
+        progress: 0,
+        message: 'Generating notes...'
+      });
+    }
+
+    let lastNoteUpdate = 0;
+    const notesPath = await generateNotes(transcriptPath, (progress) => {
+      const now = Date.now();
+      if (now - lastNoteUpdate < 500) return; // Throttle to 2 updates/sec
+      lastNoteUpdate = now;
+
+      tray.setToolTip(`Generating notes... (${progress}%)`);
+      if (settingsWindow && !settingsWindow.isDestroyed()) {
+        settingsWindow.webContents.send('processing:progress', {
+          stage: 'Summarising',
+          progress: Math.min(95, progress),
+          message: `Generating notes... (${progress}%)`
+        });
+      }
     });
 
-    // Optionally open notes file
-    // shell.openPath(notesPath);
+    const obsidianPath = exportNotesToVault(notesPath, {
+      title: buildSingleTrackNoteTitle(transcriptPath),
+      startTime: getFileStartTime(wavPath)
+    });
+
+    console.log(`Note generation complete: ${notesPath}`);
+    console.log(`Obsidian note exported: ${obsidianPath}`);
+
+    tray.setToolTip('Notes4Chris');
+
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      settingsWindow.webContents.send('processing:complete');
+    }
+
+    showNotification('Processing Complete', 'Meeting notes generated successfully!');
 
   } catch (err) {
     console.error('Processing failed:', err);
-    tray.setToolTip('Notes4Me');
+    tray.setToolTip('Notes4Chris');
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      settingsWindow.webContents.send('processing:complete');
+    }
+    showNotification('Processing Error', `Failed: ${err.message.split('\n')[0]}`, true);
+  }
+}
 
-    // Show error notification
-    tray.displayBalloon({
-      title: 'Processing Error',
-      content: `Failed: ${err.message.split('\n')[0]}`
+/**
+ * Process a dual-track session: transcribe both tracks, merge, generate speaker-aware notes
+ */
+async function processSession(sessionDir, duration) {
+  const outputDir = store.get('outputDirectory');
+
+  try {
+    // Read manifest
+    const manifestPath = path.join(sessionDir, 'manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+
+    // Step 1: Transcribe both tracks
+    tray.setToolTip('Transcribing dual tracks...');
+    console.log(`Starting session transcription for: ${sessionDir}`);
+
+    const transcripts = await transcribeSession(sessionDir, outputDir, (progress) => {
+      tray.setToolTip(`Transcribing: ${progress}%`);
+      if (settingsWindow && !settingsWindow.isDestroyed()) {
+        settingsWindow.webContents.send('processing:progress', {
+          stage: 'Transcribing',
+          progress,
+          message: `Processing dual tracks: ${progress}%`
+        });
+      }
+    }, { useSharedTranscript: store.get('useSharedTranscript') });
+
+    console.log(`Transcription complete. Merged: ${transcripts.mergedTranscript}`);
+
+    // Step 2: Generate speaker-aware notes
+    tray.setToolTip('Generating speaker-aware notes...');
+    console.log(`Starting note generation from merged transcript`);
+
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      settingsWindow.webContents.send('processing:progress', {
+        stage: 'Summarising',
+        progress: 0,
+        message: 'Generating speaker-aware notes...'
+      });
+    }
+
+    // Re-read manifest (updated by transcribeSession)
+    const updatedManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+
+    let lastSummaryUpdate = 0;
+    const notesPath = await generateSessionNotes(transcripts.mergedTranscript, updatedManifest, (progress) => {
+      const now = Date.now();
+      if (now - lastSummaryUpdate < 500) return; // Throttle to 2 updates/sec
+      lastSummaryUpdate = now;
+
+      tray.setToolTip(`Generating notes... (${progress}%)`);
+      if (settingsWindow && !settingsWindow.isDestroyed()) {
+        settingsWindow.webContents.send('processing:progress', {
+          stage: 'Summarising',
+          progress: Math.min(95, progress),
+          message: `Generating notes... (${progress}%)`
+        });
+      }
     });
+
+    if (!updatedManifest.processing) {
+      updatedManifest.processing = {};
+    }
+
+    const obsidianPath = exportNotesToVault(notesPath, {
+      title: buildSessionNoteTitle(updatedManifest),
+      startTime: updatedManifest.startTime,
+      existingPath: updatedManifest.processing.obsidianExport
+    });
+
+    // Update manifest with summarisation path
+    updatedManifest.processing.summarisation = notesPath;
+    updatedManifest.processing.obsidianExport = obsidianPath;
+    fs.writeFileSync(manifestPath, JSON.stringify(updatedManifest, null, 2), 'utf-8');
+
+    console.log(`Note generation complete: ${notesPath}`);
+    console.log(`Obsidian note exported: ${obsidianPath}`);
+
+    tray.setToolTip('Notes4Chris');
+
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      settingsWindow.webContents.send('processing:complete');
+    }
+
+    showNotification('Processing Complete', 'Speaker-aware meeting notes generated!');
+
+  } catch (err) {
+    console.error('Session processing failed:', err);
+    tray.setToolTip('Notes4Chris');
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      settingsWindow.webContents.send('processing:complete');
+    }
+    showNotification('Processing Error', `Failed: ${err.message.split('\n')[0]}`, true);
+
+    // Log error to manifest so failed sessions are identifiable
+    try {
+      const manifestPath = path.join(sessionDir, 'manifest.json');
+      if (fs.existsSync(manifestPath)) {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+        if (!manifest.processing) manifest.processing = {};
+        manifest.processing.error = err.message;
+        manifest.processing.failedAt = new Date().toISOString();
+        fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf-8');
+        console.log('Processing error logged to manifest');
+      }
+    } catch (manifestErr) {
+      console.error('Failed to write error to manifest:', manifestErr);
+    }
   }
 }
 
@@ -450,15 +906,16 @@ function showStorageStats() {
 
   console.log('Storage Statistics:');
   console.log(`Total Size: ${stats.totalSizeFormatted}`);
+  console.log(`Audio: ${stats.audioSizeFormatted}`);
+  console.log(`AI Output: ${stats.generatedSizeFormatted}`);
   console.log(`Recordings: ${stats.recordingCount}`);
   console.log(`Transcripts: ${stats.transcriptCount}`);
   console.log(`Notes: ${stats.notesCount}`);
 
-  // TODO: Show in dialog or notification in Phase 5
-  tray.displayBalloon({
-    title: 'Storage Stats',
-    content: `Total: ${stats.totalSizeFormatted}\nRecordings: ${stats.recordingCount}\nTranscripts: ${stats.transcriptCount}`
-  });
+  showNotification(
+    'Storage Stats',
+    `Total: ${stats.totalSizeFormatted}\nAudio: ${stats.audioSizeFormatted}\nAI Output: ${stats.generatedSizeFormatted}`
+  );
 }
 
 /**
@@ -475,8 +932,6 @@ function runCleanup() {
   if (deleted.length > 0) {
     console.log('Deleted files:', deleted);
   }
-
-  // TODO: Show notification in Phase 5
 }
 
 /**
@@ -485,28 +940,32 @@ function runCleanup() {
 function showDependencyStatus() {
   const status = checkDependencies();
 
-  const statusEmoji = (installed) => installed ? '✅' : '❌';
+  const statusEmoji = (installed) => installed ? 'OK' : 'MISSING';
+  const canRunSetup = !status.sox || !status.whisper;
+  const allReady = status.sox && status.whisper && status.codex && status.mic;
   const statusText = `Dependencies Status:\n\n` +
     `${statusEmoji(status.sox)} sox (audio recording)\n` +
     `${statusEmoji(status.whisper)} whisper.cpp (transcription)\n` +
-    `${statusEmoji(status.ollama)} Ollama (AI notes)\n\n` +
-    (status.sox && status.whisper && status.ollama
+    `${statusEmoji(status.codex)} AI Summarisation (Codex/Claude)\n` +
+    `${statusEmoji(status.mic)} Microphone (dual-track)\n\n` +
+    (allReady
       ? 'All dependencies installed!'
-      : 'Some dependencies are missing.\nRun "setup.sh" to install them.');
+      : (canRunSetup
+          ? 'Some recording dependencies are missing.\nRun "setup.sh" to install them.\n\nAI summarisation installs separately:\n  npm install -g @anthropic-ai/codex\n  npm install -g @anthropic-ai/claude-code'
+          : 'AI summarisation requires Codex CLI or Claude CLI.\nInstall one with:\n  npm install -g @anthropic-ai/codex\n  npm install -g @anthropic-ai/claude-code'));
 
   dialog.showMessageBox({
-    type: status.sox && status.whisper && status.ollama ? 'info' : 'warning',
+    type: allReady ? 'info' : 'warning',
     title: 'Dependency Status',
-    message: 'Meeting Recorder Dependencies',
+    message: 'Notes4Chris Dependencies',
     detail: statusText,
-    buttons: status.sox && status.whisper && status.ollama ? ['OK'] : ['Run Setup', 'OK']
+    buttons: canRunSetup ? ['Run Setup', 'OK'] : ['OK']
   }).then((result) => {
-    if (result.response === 0 && !(status.sox && status.whisper && status.ollama)) {
+    if (result.response === 0 && canRunSetup) {
       runSetupScript();
     }
   });
 
-  // Update menu after checking
   updateTrayMenu();
 }
 
@@ -514,13 +973,7 @@ function showDependencyStatus() {
  * Run setup script in terminal
  */
 function runSetupScript() {
-  const setupPath = path.join(__dirname, 'setup.sh');
-
-  // Open Terminal and run setup script
-  const command = `cd "${__dirname}" && chmod +x setup.sh && ./setup.sh`;
-
   try {
-    // Use AppleScript to open Terminal and run setup
     const appleScript = `
       tell application "Terminal"
         activate
@@ -572,16 +1025,48 @@ function formatDuration(ms) {
  * ============================================
  */
 
+// Pre-record popup
+ipcMain.handle('prerecord:getContext', async () => {
+  return store.get('meetingContext') || { title: '', participants: '', agenda: '' };
+});
+
+ipcMain.handle('prerecord:start', async (event, context) => {
+  // Close the popup
+  if (preRecordWindow && !preRecordWindow.isDestroyed()) {
+    preRecordWindow.close();
+  }
+  // Start recording with the provided context
+  startRecordingWithContext(context || {});
+  return { success: true };
+});
+
+ipcMain.handle('prerecord:cancel', async () => {
+  if (preRecordWindow && !preRecordWindow.isDestroyed()) {
+    preRecordWindow.close();
+  }
+  return { success: true };
+});
+
 // Recording Controls
 ipcMain.handle('recording:start', async () => {
   try {
-    const result = recorder.start((warning) => {
-      console.warn(warning);
-    });
-    currentRecordingPath = result.filepath;
-    tray.setTitle('🤖🔴');
-    updateTrayMenu();
-    return { success: true, filepath: result.filepath };
+    const mode = store.get('recordingMode');
+    const useDual = mode === 'dual' && dualRecorder;
+
+    if (useDual) {
+      const result = dualRecorder.start((warning) => { console.warn(warning); });
+      tray.setToolTip('Notes4Chris • Recording');
+      updateTrayMenu();
+      startLevelMonitor(true);
+      return { success: true, sessionDir: result.sessionDir };
+    } else {
+      const result = recorder.start((warning) => { console.warn(warning); });
+      currentRecordingPath = result.filepath;
+      tray.setToolTip('Notes4Chris • Recording');
+      updateTrayMenu();
+      startLevelMonitor(false);
+      return { success: true, filepath: result.filepath };
+    }
   } catch (err) {
     console.error('IPC recording:start failed:', err);
     return { success: false, error: err.message };
@@ -590,24 +1075,52 @@ ipcMain.handle('recording:start', async () => {
 
 ipcMain.handle('recording:stop', async () => {
   try {
-    const result = await recorder.stop();
-    tray.setTitle('🤖✏️');
-    updateTrayMenu();
+    stopLevelMonitor();
+    const mode = store.get('recordingMode');
+    const useDual = mode === 'dual' && dualRecorder && dualRecorder.isRecording;
 
-    // Auto-process if enabled
-    const autoProcess = store.get('autoProcess');
-    if (autoProcess) {
-      processRecording(result.filepath, result.duration).catch(err => {
-        console.error('Auto-processing failed:', err);
-      });
+    if (useDual) {
+      const result = await dualRecorder.stop();
+      tray.setToolTip('Notes4Chris');
+      updateTrayMenu();
+
+      const autoProcess = store.get('autoProcess');
+      if (autoProcess) {
+        processSession(result.sessionDir, result.duration).catch(err => {
+          console.error('Auto-processing failed:', err);
+          showNotification('Processing Error', `Failed: ${err.message.split('\n')[0]}`, true);
+          if (settingsWindow && !settingsWindow.isDestroyed()) {
+            settingsWindow.webContents.send('processing:complete', { error: err.message });
+          }
+        });
+      }
+
+      return {
+        success: true,
+        sessionDir: result.sessionDir,
+        duration: result.duration,
+        systemSize: result.systemSize,
+        micSize: result.micSize
+      };
+    } else {
+      const result = await recorder.stop();
+      tray.setToolTip('Notes4Chris');
+      updateTrayMenu();
+
+      const autoProcess = store.get('autoProcess');
+      if (autoProcess) {
+        processRecording(result.filepath, result.duration).catch(err => {
+          console.error('Auto-processing failed:', err);
+        });
+      }
+
+      return {
+        success: true,
+        filepath: result.filepath,
+        duration: result.duration,
+        size: result.size
+      };
     }
-
-    return {
-      success: true,
-      filepath: result.filepath,
-      duration: result.duration,
-      size: result.size
-    };
   } catch (err) {
     console.error('IPC recording:stop failed:', err);
     return { success: false, error: err.message };
@@ -615,16 +1128,136 @@ ipcMain.handle('recording:stop', async () => {
 });
 
 ipcMain.handle('recording:status', async () => {
-  if (!recorder) {
-    return { isRecording: false };
+  const mode = store.get('recordingMode');
+  const useDual = mode === 'dual' && dualRecorder;
+
+  if (useDual && dualRecorder.isRecording) {
+    const status = dualRecorder.getStatus();
+    return {
+      isRecording: true,
+      mode: 'dual',
+      duration: status.duration,
+      startTime: dualRecorder.startTime,
+      tracks: status.tracks
+    };
   }
 
-  const status = recorder.getStatus();
-  return {
-    isRecording: recorder.isRecording,
-    duration: status.duration,
-    fileSize: status.fileSize
-  };
+  if (recorder && recorder.isRecording) {
+    const status = recorder.getStatus();
+    return {
+      isRecording: true,
+      mode: 'system',
+      duration: status.duration,
+      startTime: recorder.startTime
+    };
+  }
+
+  return { isRecording: false };
+});
+
+// Session Reprocessing
+ipcMain.handle('session:reprocess', async (event, sessionDir) => {
+  try {
+    if (!fs.existsSync(sessionDir)) {
+      return { success: false, error: 'Session directory not found' };
+    }
+
+    const manifestPath = path.join(sessionDir, 'manifest.json');
+    if (!fs.existsSync(manifestPath)) {
+      return { success: false, error: 'Session manifest not found' };
+    }
+
+    // Clear previous error from manifest before retrying
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+    if (manifest.processing) {
+      delete manifest.processing.error;
+      delete manifest.processing.failedAt;
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf-8');
+    }
+
+    // Run processing (fire-and-forget with error handling)
+    processSession(sessionDir, null).catch(err => {
+      console.error('Reprocessing failed:', err);
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.error('IPC session:reprocess failed:', err);
+    return { success: false, error: err.message };
+  }
+});
+
+// Audio Configuration
+ipcMain.handle('audio:listInputDevices', async () => {
+  return listInputDevices();
+});
+
+ipcMain.handle('audio:preflight', async () => {
+  const checks = [];
+  const mode = store.get('recordingMode');
+
+  // Check sox
+  let soxOk = false;
+  try {
+    execSync('which sox', { encoding: 'utf-8' });
+    checks.push({ name: 'sox', pass: true, message: 'sox is installed and available' });
+    soxOk = true;
+  } catch (err) {
+    checks.push({ name: 'sox', pass: false, message: 'sox not found. Install with: brew install sox' });
+  }
+
+  // Check system audio capture (SCK preferred, BlackHole fallback)
+  const sckPath = getSckBinaryPath();
+  const sckCheck = checkSckAvailable(sckPath);
+  let bhAvailable = false;
+  try {
+    findBlackHoleDevice();
+    bhAvailable = true;
+  } catch (err) { /* not available */ }
+
+  if (sckCheck.available && sckCheck.permitted) {
+    checks.push({ name: 'System Audio', pass: true, message: 'ScreenCaptureKit — system audio capture ready' });
+  } else if (bhAvailable) {
+    const sckNote = sckCheck.available ? ' (SCK permission not granted)' : '';
+    checks.push({ name: 'System Audio', pass: true, message: `BlackHole audio device detected${sckNote}` });
+  } else if (sckCheck.available && sckCheck.permitted === false) {
+    checks.push({ name: 'System Audio', pass: false, message: 'Screen Recording permission required. Open System Settings > Privacy & Security > Screen Recording.' });
+  } else {
+    checks.push({ name: 'System Audio', pass: false, message: 'No system audio capture available. Grant Screen Recording permission or install BlackHole 2ch.' });
+  }
+
+  // Check mic (if dual mode)
+  if (mode === 'dual') {
+    const micDevice = resolveMicDevice();
+    if (micDevice) {
+      checks.push({ name: 'Microphone', pass: true, message: `Mic device: ${micDevice}` });
+    } else {
+      checks.push({ name: 'Microphone', pass: false, message: 'No microphone detected. Check System Preferences > Sound.' });
+    }
+  }
+
+  // Check whisper
+  const whisperCheck = verifyWhisper();
+  checks.push({
+    name: 'whisper.cpp',
+    pass: whisperCheck.installed,
+    message: whisperCheck.installed ? 'whisper.cpp binary and model found' : (whisperCheck.error || 'Not installed')
+  });
+
+  // Check AI summarisation (Codex or Claude CLI)
+  const preflightCodex = isCodexAvailable();
+  const preflightClaude = isClaudeAvailable();
+  const aiOk = preflightCodex || preflightClaude;
+  const aiProvider = preflightCodex ? 'Codex CLI' : 'Claude CLI';
+  checks.push({
+    name: 'AI Summarisation',
+    pass: aiOk,
+    message: aiOk
+      ? `${aiProvider} available for note generation`
+      : 'No AI provider found. Install Codex CLI or Claude CLI'
+  });
+
+  return checks;
 });
 
 // File Management
@@ -637,30 +1270,65 @@ ipcMain.handle('files:list', async () => {
       return [];
     }
 
-    const files = fs.readdirSync(recordingsDir)
-      .filter(f => f.endsWith('.wav'))
-      .map(filename => {
-        const filepath = path.join(recordingsDir, filename);
-        const stats = fs.statSync(filepath);
-        const basename = path.basename(filename, '.wav');
+    const entries = fs.readdirSync(recordingsDir);
+    const files = [];
 
-        // Check for associated transcript and notes
+    for (const entry of entries) {
+      const fullPath = path.join(recordingsDir, entry);
+      const stats = fs.statSync(fullPath);
+
+      if (stats.isDirectory() && entry.endsWith('_session')) {
+        // Session directory (dual-track)
+        const manifestPath = path.join(fullPath, 'manifest.json');
+        if (fs.existsSync(manifestPath)) {
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+          const sessionProcessedDir = path.join(processedDir, `${manifest.sessionId}_session`);
+
+          // Calculate total size
+          let totalSize = 0;
+          if (fs.existsSync(path.join(fullPath, 'system.wav'))) {
+            totalSize += fs.statSync(path.join(fullPath, 'system.wav')).size;
+          }
+          if (fs.existsSync(path.join(fullPath, 'mic.wav'))) {
+            totalSize += fs.statSync(path.join(fullPath, 'mic.wav')).size;
+          }
+
+          files.push({
+            filename: entry,
+            filepath: fullPath,
+            size: totalSize,
+            created: stats.birthtime,
+            modified: stats.mtime,
+            isDualTrack: true,
+            transcribed: fs.existsSync(path.join(sessionProcessedDir, 'merged_transcript.txt')),
+            summarised: fs.existsSync(path.join(sessionProcessedDir, 'notes.md')),
+            processingError: (manifest.processing && manifest.processing.error) || null,
+            manifest: manifest
+          });
+        }
+      } else if (entry.endsWith('.wav')) {
+        // Single-track WAV file
+        const basename = path.basename(entry, '.wav');
         const transcriptPath = path.join(processedDir, `${basename}_transcript.txt`);
         const notesPath = path.join(processedDir, `${basename}_notes.md`);
 
-        return {
-          filename,
-          filepath,
+        files.push({
+          filename: entry,
+          filepath: fullPath,
           size: stats.size,
           created: stats.birthtime,
           modified: stats.mtime,
+          isDualTrack: false,
           transcribed: fs.existsSync(transcriptPath),
           summarised: fs.existsSync(notesPath)
-        };
-      })
-      .sort((a, b) => b.created - a.created); // Newest first
+        });
+      }
+    }
 
+    // Sort newest first
+    files.sort((a, b) => b.created - a.created);
     return files;
+
   } catch (err) {
     console.error('IPC files:list failed:', err);
     return [];
@@ -673,6 +1341,10 @@ ipcMain.handle('files:stats', async () => {
     return {
       totalSize: stats.totalSize,
       totalSizeFormatted: stats.totalSizeFormatted,
+      audioSize: stats.audioSize,
+      audioSizeFormatted: stats.audioSizeFormatted,
+      generatedSize: stats.generatedSize,
+      generatedSizeFormatted: stats.generatedSizeFormatted,
       recordingsCount: stats.recordingCount,
       transcriptsCount: stats.transcriptCount,
       notesCount: stats.notesCount
@@ -682,6 +1354,10 @@ ipcMain.handle('files:stats', async () => {
     return {
       totalSize: 0,
       totalSizeFormatted: '0 B',
+      audioSize: 0,
+      audioSizeFormatted: '0 B',
+      generatedSize: 0,
+      generatedSizeFormatted: '0 B',
       recordingsCount: 0,
       transcriptsCount: 0,
       notesCount: 0
@@ -693,29 +1369,51 @@ ipcMain.handle('files:delete', async (event, filename) => {
   try {
     const recordingsDir = path.join(store.get('outputDirectory'), 'recordings');
     const processedDir = path.join(store.get('outputDirectory'), 'processed');
-
     const deletedFiles = [];
-    const basename = path.basename(filename, '.wav');
 
-    // Delete recording
-    const wavPath = path.join(recordingsDir, filename);
-    if (fs.existsSync(wavPath)) {
-      fs.unlinkSync(wavPath);
-      deletedFiles.push(filename);
-    }
+    if (filename.endsWith('_session')) {
+      // Delete session directory
+      const sessionPath = path.join(recordingsDir, filename);
+      if (fs.existsSync(sessionPath)) {
+        // Read manifest for session ID
+        const manifestPath = path.join(sessionPath, 'manifest.json');
+        let sessionId = filename.replace('_session', '');
+        if (fs.existsSync(manifestPath)) {
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+          sessionId = manifest.sessionId;
+        }
 
-    // Delete transcript
-    const transcriptPath = path.join(processedDir, `${basename}_transcript.txt`);
-    if (fs.existsSync(transcriptPath)) {
-      fs.unlinkSync(transcriptPath);
-      deletedFiles.push(`${basename}_transcript.txt`);
-    }
+        fs.rmSync(sessionPath, { recursive: true, force: true });
+        deletedFiles.push(filename);
 
-    // Delete notes
-    const notesPath = path.join(processedDir, `${basename}_notes.md`);
-    if (fs.existsSync(notesPath)) {
-      fs.unlinkSync(notesPath);
-      deletedFiles.push(`${basename}_notes.md`);
+        // Delete processed session dir
+        const sessionProcessedDir = path.join(processedDir, `${sessionId}_session`);
+        if (fs.existsSync(sessionProcessedDir)) {
+          fs.rmSync(sessionProcessedDir, { recursive: true, force: true });
+          deletedFiles.push(`${sessionId}_session (processed)`);
+        }
+      }
+    } else {
+      // Delete single WAV file
+      const basename = path.basename(filename, '.wav');
+
+      const wavPath = path.join(recordingsDir, filename);
+      if (fs.existsSync(wavPath)) {
+        fs.unlinkSync(wavPath);
+        deletedFiles.push(filename);
+      }
+
+      const transcriptPath = path.join(processedDir, `${basename}_transcript.txt`);
+      if (fs.existsSync(transcriptPath)) {
+        fs.unlinkSync(transcriptPath);
+        deletedFiles.push(`${basename}_transcript.txt`);
+      }
+
+      const notesPath = path.join(processedDir, `${basename}_notes.md`);
+      if (fs.existsSync(notesPath)) {
+        fs.unlinkSync(notesPath);
+        deletedFiles.push(`${basename}_notes.md`);
+      }
     }
 
     return { success: true, deletedFiles };
@@ -732,15 +1430,11 @@ ipcMain.handle('files:cleanup', async () => {
       store.get('retentionDays')
     );
 
-    // Calculate freed space
-    let freedSpace = 0;
-    // We can't calculate this accurately after deletion, but we can estimate
-
     return {
       success: true,
       deletedCount: deleted.length,
       deletedFiles: deleted,
-      freedSpace
+      freedSpace: 0
     };
   } catch (err) {
     console.error('IPC files:cleanup failed:', err);
@@ -763,12 +1457,11 @@ ipcMain.handle('process:transcribe', async (event, wavPath) => {
   try {
     const outputDir = store.get('outputDirectory');
     const transcriptPath = await transcribe(wavPath, outputDir, (progress) => {
-      // Send progress updates to renderer
       if (BrowserWindow.getAllWindows().length > 0) {
         BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
-          stage: 'transcription',
+          stage: 'Transcribing',
           progress,
-          message: `Transcribing: ${progress}%`
+          message: `Processing audio: ${progress}%`
         });
       }
     });
@@ -782,51 +1475,128 @@ ipcMain.handle('process:transcribe', async (event, wavPath) => {
 
 ipcMain.handle('process:summarise', async (event, transcriptPath) => {
   try {
-    const notesPath = await generateNotes(transcriptPath, (bytesWritten) => {
-      // Send progress updates to renderer
-      if (BrowserWindow.getAllWindows().length > 0 && bytesWritten % 100 === 0) {
+    const notesPath = await generateNotes(transcriptPath, (progress) => {
+      if (BrowserWindow.getAllWindows().length > 0) {
         BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
-          stage: 'summarisation',
-          progress: Math.floor(bytesWritten / 100),
-          message: `Generating notes... (${Math.floor(bytesWritten / 100)} chars)`
+          stage: 'Summarising',
+          progress: Math.min(95, progress),
+          message: `Generating notes... (${progress}%)`
         });
       }
     });
 
-    return { success: true, notesPath };
+    const obsidianPath = exportNotesToVault(notesPath, {
+      title: buildSingleTrackNoteTitle(transcriptPath),
+      startTime: getFileStartTime(transcriptPath)
+    });
+
+    return { success: true, notesPath, obsidianPath };
   } catch (err) {
     console.error('IPC process:summarise failed:', err);
     return { success: false, error: err.message };
   }
 });
 
-ipcMain.handle('process:full', async (event, wavPath) => {
+ipcMain.handle('process:full', async (event, wavPathOrSessionDir) => {
   try {
     const outputDir = store.get('outputDirectory');
 
-    // Transcribe
-    const transcriptPath = await transcribe(wavPath, outputDir, (progress) => {
+    // Detect if this is a session directory or a flat WAV file
+    if (fs.existsSync(path.join(wavPathOrSessionDir, 'manifest.json'))) {
+      // Session directory - use dual-track pipeline
+      const manifestPath = path.join(wavPathOrSessionDir, 'manifest.json');
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+
+      const transcripts = await transcribeSession(wavPathOrSessionDir, outputDir, (progress) => {
+        if (BrowserWindow.getAllWindows().length > 0) {
+          BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
+            stage: 'Transcribing',
+            progress,
+            message: `Processing dual tracks: ${progress}%`
+          });
+        }
+      });
+
+      const updatedManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+
       if (BrowserWindow.getAllWindows().length > 0) {
         BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
-          stage: 'transcription',
-          progress,
-          message: `Transcribing: ${progress}%`
+          stage: 'Summarising',
+          progress: 0,
+          message: 'Generating speaker-aware notes...'
         });
       }
-    });
 
-    // Generate notes
-    const notesPath = await generateNotes(transcriptPath, (bytesWritten) => {
-      if (BrowserWindow.getAllWindows().length > 0 && bytesWritten % 100 === 0) {
+      const notesPath = await generateSessionNotes(transcripts.mergedTranscript, updatedManifest, (progress) => {
+        if (BrowserWindow.getAllWindows().length > 0) {
+          BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
+            stage: 'Summarising',
+            progress: Math.min(95, progress),
+            message: `Generating notes... (${progress}%)`
+          });
+        }
+      });
+
+      if (!updatedManifest.processing) {
+        updatedManifest.processing = {};
+      }
+
+      const obsidianPath = exportNotesToVault(notesPath, {
+        title: buildSessionNoteTitle(updatedManifest),
+        startTime: updatedManifest.startTime,
+        existingPath: updatedManifest.processing.obsidianExport
+      });
+
+      updatedManifest.processing.summarisation = notesPath;
+      updatedManifest.processing.obsidianExport = obsidianPath;
+      fs.writeFileSync(manifestPath, JSON.stringify(updatedManifest, null, 2), 'utf-8');
+
+      if (BrowserWindow.getAllWindows().length > 0) {
+        BrowserWindow.getAllWindows()[0].webContents.send('processing:complete');
+      }
+
+      return { success: true, mergedTranscript: transcripts.mergedTranscript, notesPath, obsidianPath };
+    } else {
+      // Single WAV file - use original pipeline
+      const transcriptPath = await transcribe(wavPathOrSessionDir, outputDir, (progress) => {
+        if (BrowserWindow.getAllWindows().length > 0) {
+          BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
+            stage: 'Transcribing',
+            progress,
+            message: `Processing audio: ${progress}%`
+          });
+        }
+      });
+
+      if (BrowserWindow.getAllWindows().length > 0) {
         BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
-          stage: 'summarisation',
-          progress: Math.floor(bytesWritten / 100),
-          message: `Generating notes...`
+          stage: 'Summarising',
+          progress: 0,
+          message: 'Generating notes...'
         });
       }
-    });
 
-    return { success: true, transcriptPath, notesPath };
+      const notesPath = await generateNotes(transcriptPath, (progress) => {
+        if (BrowserWindow.getAllWindows().length > 0) {
+          BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
+            stage: 'Summarising',
+            progress: Math.min(95, progress),
+            message: `Generating notes... (${progress}%)`
+          });
+        }
+      });
+
+      const obsidianPath = exportNotesToVault(notesPath, {
+        title: buildSingleTrackNoteTitle(transcriptPath),
+        startTime: getFileStartTime(wavPathOrSessionDir)
+      });
+
+      if (BrowserWindow.getAllWindows().length > 0) {
+        BrowserWindow.getAllWindows()[0].webContents.send('processing:complete');
+      }
+
+      return { success: true, transcriptPath, notesPath, obsidianPath };
+    }
   } catch (err) {
     console.error('IPC process:full failed:', err);
     return { success: false, error: err.message };
@@ -838,7 +1608,12 @@ ipcMain.handle('settings:get', async () => {
   return {
     outputDirectory: store.get('outputDirectory'),
     retentionDays: store.get('retentionDays'),
-    autoProcess: store.get('autoProcess')
+    autoProcess: store.get('autoProcess'),
+    recordingMode: store.get('recordingMode'),
+    micDevice: store.get('micDevice'),
+    systemLabel: store.get('systemLabel'),
+    micLabel: store.get('micLabel'),
+    meetingContext: store.get('meetingContext')
   };
 });
 
@@ -846,8 +1621,6 @@ ipcMain.handle('settings:update', async (event, settings) => {
   try {
     if (settings.outputDirectory !== undefined) {
       store.set('outputDirectory', settings.outputDirectory);
-      // Reinitialize recorder with new directory
-      initRecorder();
     }
     if (settings.retentionDays !== undefined) {
       store.set('retentionDays', settings.retentionDays);
@@ -855,6 +1628,24 @@ ipcMain.handle('settings:update', async (event, settings) => {
     if (settings.autoProcess !== undefined) {
       store.set('autoProcess', settings.autoProcess);
     }
+    if (settings.recordingMode !== undefined) {
+      store.set('recordingMode', settings.recordingMode);
+    }
+    if (settings.micDevice !== undefined) {
+      store.set('micDevice', settings.micDevice);
+    }
+    if (settings.systemLabel !== undefined) {
+      store.set('systemLabel', settings.systemLabel);
+    }
+    if (settings.micLabel !== undefined) {
+      store.set('micLabel', settings.micLabel);
+    }
+    if (settings.meetingContext !== undefined) {
+      store.set('meetingContext', settings.meetingContext);
+    }
+
+    // Reinitialize recorder with new settings
+    initRecorder();
 
     return { success: true };
   } catch (err) {
@@ -880,13 +1671,84 @@ ipcMain.handle('system:dependencies', async () => {
   return {
     sox: status.sox,
     whisper: status.whisper,
-    ollama: status.ollama,
-    blackhole: status.sox // BlackHole check is part of sox check
+    codex: status.codex,
+    systemAudio: status.systemAudio,
+    mic: status.mic
   };
 });
 
 ipcMain.handle('system:version', async () => {
   return app.getVersion();
+});
+
+ipcMain.handle('system:chooseOutputDir', async () => {
+  try {
+    const result = await dialog.showOpenDialog(settingsWindow || undefined, {
+      title: 'Choose Output Folder',
+      defaultPath: store.get('outputDirectory'),
+      buttonLabel: 'Choose Folder',
+      properties: ['openDirectory', 'createDirectory']
+    });
+
+    if (result.canceled || result.filePaths.length === 0) {
+      return { canceled: true };
+    }
+
+    return { canceled: false, path: result.filePaths[0] };
+  } catch (err) {
+    console.error('IPC system:chooseOutputDir failed:', err);
+    return { canceled: true, error: err.message };
+  }
+});
+
+ipcMain.handle('dialog:confirm', async (event, options = {}) => {
+  try {
+    const response = await dialog.showMessageBox(settingsWindow || undefined, {
+      type: options.destructive ? 'warning' : 'question',
+      buttons: [options.confirmLabel || 'Continue', options.cancelLabel || 'Cancel'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+      title: options.title || 'Confirm',
+      message: options.message || 'Are you sure?',
+      detail: options.detail || ''
+    });
+
+    return { confirmed: response.response === 0 };
+  } catch (err) {
+    console.error('IPC dialog:confirm failed:', err);
+    return { confirmed: false, error: err.message };
+  }
+});
+
+ipcMain.handle('system:requestScreenCapturePermission', async () => {
+  const sckPath = getSckBinaryPath();
+  const sckCheck = checkSckAvailable(sckPath);
+
+  if (sckCheck.available && sckCheck.permitted) {
+    return { success: true, message: 'Permission already granted' };
+  }
+
+  if (!sckCheck.available) {
+    return { success: false, message: sckCheck.reason || 'ScreenCaptureKit not available' };
+  }
+
+  // Show dialog prompting the user to grant permission
+  const response = await dialog.showMessageBox({
+    type: 'info',
+    title: 'Screen Recording Permission Required',
+    message: 'Notes4Chris needs Screen Recording permission to capture system audio.',
+    detail: 'This replaces the need for BlackHole virtual audio device.\n\n' +
+            'Click "Open System Settings" to grant permission, then restart the app.',
+    buttons: ['Open System Settings', 'Cancel'],
+    defaultId: 0
+  });
+
+  if (response.response === 0) {
+    shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+  }
+
+  return { success: false, message: 'Permission not yet granted' };
 });
 
 ipcMain.handle('system:openOutputDir', async () => {
@@ -903,47 +1765,39 @@ ipcMain.handle('system:openOutputDir', async () => {
  * App lifecycle: Ready
  */
 app.whenReady().then(() => {
-  console.log('Notes4Me starting...');
+  console.log('Notes4Chris starting...');
   console.log(`Electron version: ${process.versions.electron}`);
   console.log(`Node version: ${process.versions.node}`);
+  console.log(`Recording mode: ${store.get('recordingMode')}`);
 
-  // Set dock icon (macOS only)
+  // Hide dock icon — menu bar only app
   if (process.platform === 'darwin' && app.dock) {
-    const iconPath = path.join(__dirname, 'assets', 'icon.png');
-    if (fs.existsSync(iconPath)) {
-      try {
-        const icon = nativeImage.createFromPath(iconPath);
-        app.dock.setIcon(icon);
-        console.log('✅ Dock icon set');
-      } catch (err) {
-        console.warn('⚠️  Failed to set dock icon:', err.message);
-      }
-    } else {
-      console.warn('⚠️  Icon file not found. Create assets/icon.png following ICON_INSTRUCTIONS.md');
-    }
+    app.dock.hide();
   }
 
   // Initialize recorder and tray
   initRecorder();
   createTray();
 
-  // Check dependencies on startup
+  // Check dependencies on startup, then refresh tray menu with results
   const deps = checkDependencies();
+  updateTrayMenu();
 
   // Run cleanup on startup
   runCleanup();
 
-  console.log('Notes4Me ready. Click the menu bar icon to start recording.');
+  console.log('Notes4Chris ready. Click the menu bar icon to start recording.');
 
   // Show welcome message if dependencies are missing
   if (!deps.sox || !deps.whisper) {
     setTimeout(() => {
       const response = dialog.showMessageBoxSync({
         type: 'info',
-        title: 'Welcome to Meeting Recorder',
+        title: 'Welcome to Notes4Chris',
         message: 'Setup Required',
         detail: 'Some dependencies are missing. Would you like to run the setup script now?\n\n' +
-               'This will install:\n• sox (audio recording)\n• whisper.cpp (transcription)\n• Ollama (AI notes)',
+               'This will install:\n- sox (audio recording)\n- whisper.cpp (transcription)\n\n' +
+               'AI summarisation installs separately:\n- npm install -g @anthropic-ai/codex\n- npm install -g @anthropic-ai/claude-code',
         buttons: ['Run Setup', 'Check Status', 'Skip'],
         defaultId: 0
       });
@@ -962,7 +1816,6 @@ app.whenReady().then(() => {
  * Don't quit - we're a menu bar app
  */
 app.on('window-all-closed', (e) => {
-  // Prevent quit on window close for menu bar apps
   e.preventDefault();
 });
 
@@ -973,10 +1826,18 @@ app.on('window-all-closed', (e) => {
 app.on('before-quit', () => {
   console.log('App quitting, cleaning up...');
 
+  // Stop level monitor
+  stopLevelMonitor();
+
   // Stop recording if active
   if (recorder && recorder.isRecording) {
-    console.log('Stopping active recording...');
+    console.log('Stopping active system recording...');
     recorder.cleanup();
+  }
+
+  if (dualRecorder && dualRecorder.isRecording) {
+    console.log('Stopping active dual recording...');
+    dualRecorder.cleanup();
   }
 
   // Kill all registered child processes
@@ -1000,12 +1861,8 @@ if (!gotTheLock) {
 } else {
   app.on('second-instance', () => {
     console.log('Attempted to start second instance');
-    // Focus the tray or show a notification
     if (tray) {
-      tray.displayBalloon({
-        title: 'Notes4Me',
-        content: 'Already running in menu bar'
-      });
+      showNotification('Notes4Chris', 'Already running in menu bar');
     }
   });
 }

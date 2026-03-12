@@ -1,89 +1,381 @@
+const { execSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
-const OLLAMA_BASE_URL = 'http://localhost:11434';
-const DEFAULT_MODEL = 'llama3.2';
+const LLM_TIMEOUT = 300000; // 5 minutes (large transcripts need more time)
+const OBSIDIAN_FILENAME_LIMIT = 120;
 
 /**
- * Check if Ollama is available and responding
+ * Check if Codex CLI is available
  *
- * @returns {Promise<boolean>} True if Ollama is healthy
- * @throws {Error} If Ollama is not available or no models are installed
+ * @returns {boolean}
  */
-async function checkOllamaHealth() {
+function isCodexAvailable() {
   try {
-    const response = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
-      signal: AbortSignal.timeout(3000)
-    });
-
-    if (!response.ok) {
-      throw new Error(`Ollama returned status ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    if (!data.models || data.models.length === 0) {
-      throw new Error(
-        'No Ollama models found.\n' +
-        'Install a model with: ollama pull llama3.2'
-      );
-    }
-
-    // Check if our preferred model is available
-    const hasPreferredModel = data.models.some(m => m.name.includes('llama'));
-
-    if (!hasPreferredModel) {
-      console.warn(`Preferred model (llama3.2) not found. Available models: ${data.models.map(m => m.name).join(', ')}`);
-    }
-
+    execSync('which codex', { encoding: 'utf-8', stdio: 'pipe' });
     return true;
-
   } catch (err) {
-    if (err.name === 'AbortError' || err.message.includes('fetch failed')) {
-      throw new Error(
-        'Ollama not available.\n' +
-        'Please start Ollama:\n' +
-        '  ollama serve\n' +
-        'Or install it:\n' +
-        '  brew install ollama'
-      );
-    }
-
-    throw err;
+    return false;
   }
 }
 
 /**
- * Generate meeting notes from transcript using Ollama
+ * Check if Claude CLI is available
+ *
+ * @returns {boolean}
+ */
+function isClaudeAvailable() {
+  try {
+    execSync('which claude', { encoding: 'utf-8', stdio: 'pipe' });
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+/**
+ * Run a prompt through Codex CLI headlessly
+ *
+ * Same pattern as essaybuddy's codex_provider — shells out to
+ * `codex exec --full-auto --ephemeral` with a minimal config
+ * that disables MCP servers to avoid startup latency.
+ *
+ * @param {string} prompt - The prompt to send
+ * @returns {Promise<string>} The response text
+ */
+async function runCodex(prompt) {
+  // Use a stable directory under real home (Codex refuses to run with HOME in /tmp)
+  const realHome = os.homedir();
+  const isolatedHome = path.join(realHome, '.cache', 'notes4chris-codex');
+  const codexDir = path.join(isolatedHome, '.codex');
+  fs.mkdirSync(codexDir, { recursive: true });
+
+  try {
+    // Minimal codex config (no MCP servers to avoid startup latency)
+    fs.writeFileSync(path.join(codexDir, 'config.toml'), '[mcp_servers]\n', 'utf-8');
+
+    // Copy auth from real codex config
+    const realAuth = path.join(realHome, '.codex', 'auth.json');
+    if (fs.existsSync(realAuth)) {
+      fs.copyFileSync(realAuth, path.join(codexDir, 'auth.json'));
+    }
+
+    const env = {
+      PATH: process.env.PATH || '',
+      HOME: isolatedHome,
+    };
+
+    for (const key of ['CODEX_TOKEN', 'OPENAI_API_KEY']) {
+      if (process.env[key]) {
+        env[key] = process.env[key];
+      }
+    }
+
+    return new Promise((resolve, reject) => {
+      const proc = spawn('codex', ['exec', '--full-auto', '--skip-git-repo-check', '--ephemeral'], {
+        cwd: isolatedHome,
+        env: env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      proc.stdout.on('data', (data) => { stdout += data.toString(); });
+      proc.stderr.on('data', (data) => { stderr += data.toString(); });
+
+      // Suppress EPIPE errors on stdin (child may exit before we finish writing)
+      proc.stdin.on('error', (err) => {
+        if (err.code !== 'EPIPE') throw err;
+      });
+
+      // Use end(data) to write + close atomically, handling backpressure
+      proc.stdin.end(prompt, 'utf-8');
+
+      const timeout = setTimeout(() => {
+        try { proc.kill('SIGKILL'); } catch (e) { /* already dead */ }
+        reject(new Error(`Codex timed out after ${LLM_TIMEOUT / 1000}s`));
+      }, LLM_TIMEOUT);
+
+      proc.on('close', (code) => {
+        clearTimeout(timeout);
+
+        const output = stripAnsi(stdout).trim();
+
+        if (code !== 0 && !output) {
+          const err = stderr.trim();
+          reject(new Error(`Codex failed: ${truncateError(err)}`));
+          return;
+        }
+
+        const content = extractContent(output);
+        if (!content) {
+          reject(new Error('Codex returned empty output'));
+          return;
+        }
+
+        resolve(content);
+      });
+
+      proc.on('error', (err) => {
+        clearTimeout(timeout);
+        reject(new Error(`Failed to start Codex: ${err.message}`));
+      });
+    });
+  } finally {
+    // Stable cache dir — no cleanup needed
+  }
+}
+
+/**
+ * Run a prompt through Claude CLI headlessly
+ *
+ * Uses `claude -p` (print mode) with stdin for the prompt.
+ * Fallback provider when Codex is unavailable or fails.
+ *
+ * @param {string} prompt - The prompt to send
+ * @returns {Promise<string>} The response text
+ */
+async function runClaude(prompt) {
+  // Inherit full env so Claude CLI can find its auth/config in ~/.claude/
+  // Strip nested-session blockers that prevent launching from within Claude Code
+  const env = { ...process.env };
+  delete env.CLAUDECODE;
+  delete env.CLAUDE_CODE_ENTRYPOINT;
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn('claude', [
+      '-p',
+      '--model', 'sonnet',
+      '--output-format', 'text',
+      '--no-session-persistence',
+    ], {
+      cwd: os.homedir(),
+      env: env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (data) => { stdout += data.toString(); });
+    proc.stderr.on('data', (data) => { stderr += data.toString(); });
+
+    // Suppress EPIPE errors on stdin (child may exit before we finish writing)
+    proc.stdin.on('error', (err) => {
+      if (err.code !== 'EPIPE') throw err;
+    });
+
+    proc.stdin.end(prompt, 'utf-8');
+
+    const timeout = setTimeout(() => {
+      try { proc.kill('SIGKILL'); } catch (e) { /* already dead */ }
+      reject(new Error(`Claude timed out after ${LLM_TIMEOUT / 1000}s`));
+    }, LLM_TIMEOUT);
+
+    proc.on('close', (code) => {
+      clearTimeout(timeout);
+
+      const output = stdout.trim();
+
+      if (code !== 0 && !output) {
+        const err = stderr.trim();
+        reject(new Error(`Claude failed (exit ${code}): ${err.slice(0, 300)}`));
+        return;
+      }
+
+      if (!output) {
+        reject(new Error('Claude returned empty output'));
+        return;
+      }
+
+      // Detect auth/login errors that Claude emits as stdout with exit 0
+      if (output.match(/not logged in|please run \/login/i)) {
+        reject(new Error('Claude CLI not authenticated. Run "claude" in a terminal to log in.'));
+        return;
+      }
+
+      resolve(output);
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(timeout);
+      reject(new Error(`Failed to start Claude: ${err.message}`));
+    });
+  });
+}
+
+/**
+ * Strip ANSI escape codes from text
+ */
+function stripAnsi(text) {
+  return text.replace(/\x1b\[[0-9;]*m/g, '');
+}
+
+/**
+ * Extract meaningful error from Codex stderr
+ */
+function truncateError(err) {
+  const lines = err.split('\n');
+  const errorLines = [];
+  for (const line of lines) {
+    if (line.startsWith('--------') || line.startsWith('session id:') || line.startsWith('user')) break;
+    const stripped = line.trim();
+    if (stripped && !stripped.startsWith('Reading prompt from stdin')) {
+      errorLines.push(stripped);
+    }
+  }
+  if (errorLines.length) return errorLines.join(' ').slice(0, 300);
+  return err.slice(0, 300);
+}
+
+/**
+ * Extract AI response content from Codex CLI output
+ */
+function extractContent(text) {
+  const match = text.match(/\bassistant\s*\n/);
+  if (match) {
+    text = text.slice(match.index + match[0].length);
+  }
+
+  const fenced = text.match(/```(?:markdown|md)?\s*\n([\s\S]*?)\n```/);
+  if (fenced) return fenced[1].trim();
+
+  return text.trim();
+}
+
+/**
+ * Export generated notes to an Obsidian vault.
+ *
+ * Keeps the app's internal notes copy intact and writes a vault-friendly
+ * Markdown file using a stable name when reprocessing an existing session.
+ *
+ * @param {string} notesPath - Path to the generated markdown notes
+ * @param {string} vaultDir - Obsidian vault directory
+ * @param {object} [options]
+ * @param {string} [options.title] - Preferred title for the exported note
+ * @param {string} [options.startTime] - ISO timestamp used in the filename
+ * @param {string} [options.existingPath] - Existing export path to overwrite
+ * @returns {string|null} Exported file path, or null when no vault is configured
+ */
+function exportNotesToObsidian(notesPath, vaultDir, options = {}) {
+  if (!vaultDir) {
+    return null;
+  }
+
+  if (!fs.existsSync(notesPath)) {
+    throw new Error(`Notes file not found: ${notesPath}`);
+  }
+
+  const resolvedVaultDir = path.resolve(vaultDir);
+  if (!fs.existsSync(resolvedVaultDir)) {
+    fs.mkdirSync(resolvedVaultDir, { recursive: true });
+  }
+
+  const exportPath = resolveObsidianExportPath(resolvedVaultDir, notesPath, options);
+  fs.mkdirSync(path.dirname(exportPath), { recursive: true });
+  fs.copyFileSync(notesPath, exportPath);
+
+  console.log(`Obsidian export complete: ${exportPath}`);
+  return exportPath;
+}
+
+/**
+ * Resolve the target vault path for an exported note.
+ */
+function resolveObsidianExportPath(vaultDir, notesPath, options) {
+  if (options.existingPath) {
+    return path.resolve(options.existingPath);
+  }
+
+  const filename = buildObsidianFilename(notesPath, options);
+  return path.join(vaultDir, filename);
+}
+
+/**
+ * Build an Obsidian-friendly filename from note metadata.
+ */
+function buildObsidianFilename(notesPath, options) {
+  const title = normaliseExportTitle(options.title || path.basename(notesPath, '.md')) || 'Meeting summary';
+  const timestamp = formatTimestampForFilename(options.startTime);
+  const stem = timestamp ? `${timestamp} - ${title}` : title;
+  return `${truncateFilename(stem)}.md`;
+}
+
+/**
+ * Convert a title into a filesystem-safe form.
+ */
+function normaliseExportTitle(value) {
+  return String(value || '')
+    .replace(/\.[^/.]+$/, '')
+    .replace(/[_-]+notes?$/i, '')
+    .replace(/[_-]+transcript$/i, '')
+    .replace(/[_-]+session$/i, '')
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, ' ')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Format a timestamp for a note filename in local time.
+ */
+function formatTimestampForFilename(value) {
+  if (!value) {
+    return null;
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const seconds = String(date.getSeconds()).padStart(2, '0');
+
+  return `${year}-${month}-${day} ${hours}-${minutes}-${seconds}`;
+}
+
+/**
+ * Keep exported filenames readable and below a sensible limit.
+ */
+function truncateFilename(value) {
+  if (value.length <= OBSIDIAN_FILENAME_LIMIT) {
+    return value;
+  }
+
+  return value.slice(0, OBSIDIAN_FILENAME_LIMIT).trim();
+}
+
+/**
+ * Generate meeting notes from transcript (legacy single-track)
+ *
+ * Uses Codex CLI only.
  *
  * @param {string} transcriptPath - Path to transcript text file
- * @param {Function} [progressCallback] - Optional callback for progress updates (bytes written)
+ * @param {Function} [progressCallback] - Optional callback for progress updates
  * @returns {Promise<string>} Path to generated notes markdown file
- * @throws {Error} If note generation fails
  */
 async function generateNotes(transcriptPath, progressCallback) {
-  // Verify Ollama is available
-  await checkOllamaHealth();
-
-  // Read transcript
   if (!fs.existsSync(transcriptPath)) {
     throw new Error(`Transcript file not found: ${transcriptPath}`);
   }
 
   const transcript = fs.readFileSync(transcriptPath, 'utf-8');
-
   if (transcript.trim().length === 0) {
     throw new Error('Transcript is empty. Cannot generate notes from empty transcript.');
   }
 
-  // Generate output path
   const outputPath = transcriptPath.replace('_transcript.txt', '_notes.md');
 
   console.log(`Generating notes from transcript: ${transcriptPath}`);
-  console.log(`Output will be saved to: ${outputPath}`);
 
-  // Craft prompt for structured note generation
-  const prompt = `You create clear and structured meeting notes. Read the transcript and produce well-organised notes with accurate detail and concise wording. Infer the meeting date if it’s mentioned or implied.
+  const prompt = `You create clear and structured meeting notes. Read the transcript and produce well-organised notes with accurate detail and concise wording. Infer the meeting date if it's mentioned or implied.
 
 Use the following sections when they apply:
 
@@ -97,7 +389,7 @@ Blocker
 Solution or Proposal
 Next Steps
 
-Write in plain UK English. Keep each section brief but complete. Do not invent details that aren’t supported by the transcript.
+Write in plain UK English. Keep each section brief but complete. Do not invent details that aren't supported by the transcript.
 
 ---
 
@@ -108,132 +400,180 @@ ${transcript}
 
 Generate comprehensive meeting notes following the format above. Extract actual names, specific action items, and technical details from the transcript. If certain sections don't apply (e.g., no blockers discussed), you can omit them. Be concise but thorough.`;
 
-  try {
-    const response = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: DEFAULT_MODEL,
-        prompt: prompt,
-        stream: true,
-        options: {
-          temperature: 0.7,  // Balanced creativity/accuracy
-          top_p: 0.9,
-          top_k: 40
-        }
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(`Ollama request failed with status ${response.status}`);
-    }
-
-    let fullResponse = '';
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      const chunk = decoder.decode(value);
-      const lines = chunk.split('\n').filter(line => line.trim());
-
-      for (let line of lines) {
-        try {
-          const json = JSON.parse(line);
-
-          if (json.response) {
-            fullResponse += json.response;
-
-            // Call progress callback if provided
-            if (progressCallback && !json.done) {
-              progressCallback(fullResponse.length);
-            }
-          }
-
-          if (json.error) {
-            throw new Error(`Ollama error: ${json.error}`);
-          }
-
-        } catch (parseErr) {
-          // Skip invalid JSON lines
-          if (!parseErr.message.includes('Unexpected')) {
-            console.warn('Failed to parse JSON line:', line);
-          }
-        }
-      }
-    }
-
-    // Verify we got a response
-    if (fullResponse.trim().length === 0) {
-      throw new Error('Ollama returned empty response');
-    }
-
-    // Write notes to file
-    fs.writeFileSync(outputPath, fullResponse.trim(), 'utf-8');
-
-    console.log(`Notes generated successfully: ${outputPath}`);
-    console.log(`Note length: ${fullResponse.length} characters`);
-
-    return outputPath;
-
-  } catch (err) {
-    if (err.message.includes('fetch failed') || err.name === 'AbortError') {
-      throw new Error('Failed to connect to Ollama. Ensure Ollama is running: ollama serve');
-    }
-
-    throw err;
-  }
+  const notes = await runLLM(prompt, progressCallback);
+  fs.writeFileSync(outputPath, notes, 'utf-8');
+  console.log(`Notes generated successfully: ${outputPath}`);
+  return outputPath;
 }
 
 /**
- * Get list of available Ollama models
+ * Generate speaker-aware meeting notes from a merged dual-track transcript
  *
- * @returns {Promise<Array<{name: string, size: number}>>} List of models
+ * @param {string} mergedTranscriptPath - Path to merged speaker-labeled transcript
+ * @param {object} manifest - Session manifest object
+ * @param {Function} [progressCallback] - Optional callback for progress updates
+ * @returns {Promise<string>} Path to generated notes markdown file
  */
-async function listModels() {
-  try {
-    const response = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
-      signal: AbortSignal.timeout(3000)
-    });
+async function generateSessionNotes(mergedTranscriptPath, manifest, progressCallback) {
+  if (!fs.existsSync(mergedTranscriptPath)) {
+    throw new Error(`Merged transcript not found: ${mergedTranscriptPath}`);
+  }
 
-    if (!response.ok) {
-      throw new Error('Failed to fetch models from Ollama');
+  const transcript = fs.readFileSync(mergedTranscriptPath, 'utf-8');
+  if (transcript.trim().length === 0) {
+    throw new Error('Merged transcript is empty. Cannot generate notes.');
+  }
+
+  const outputDir = path.dirname(mergedTranscriptPath);
+  const outputPath = path.join(outputDir, 'notes.md');
+
+  const systemLabel = manifest.tracks.system.label || 'Remote';
+  const micLabel = manifest.tracks.mic.label || 'Me';
+  const ctx = manifest.meetingContext || {};
+
+  console.log(`Generating speaker-aware notes from: ${mergedTranscriptPath}`);
+  console.log(`Speakers: ${systemLabel} (system), ${micLabel} (mic)`);
+  if (ctx.title) console.log(`Meeting context: ${ctx.title}`);
+
+  // Build context block if any meeting context was provided
+  let contextBlock = '';
+  if (ctx.title || ctx.participants || ctx.agenda) {
+    contextBlock = '\n\nMeeting context provided by the user:\n';
+    if (ctx.title) contextBlock += `- Meeting title: ${ctx.title}\n`;
+    if (ctx.participants) contextBlock += `- Participants: ${ctx.participants}\n`;
+    if (ctx.agenda) contextBlock += `- Agenda/notes: ${ctx.agenda}\n`;
+    contextBlock += '\nUse this context to improve accuracy — use real participant names where possible, and reference the agenda topics.\n';
+  }
+
+  const prompt = `You create clear and structured meeting notes from a dual-track transcript. The transcript has two speakers:
+- "${systemLabel}" — the remote participant(s) heard through system audio
+- "${micLabel}" — the local user speaking into their microphone
+${contextBlock}
+Read the transcript and produce well-organised, speaker-aware notes with accurate detail and concise wording. Infer the meeting date if it's mentioned or implied.
+
+Use the following sections when they apply:
+
+## Meeting Notes [Include inferred date]
+
+## Participants
+List the speakers identified in the transcript.
+
+## Meeting Purpose
+Brief summary of what this meeting was about.
+
+## Key Takeaways
+The most important outcomes or decisions.
+
+## Topics Discussed
+Organized by topic, noting who raised each point.
+
+## Action Items
+All action items with owner attribution:
+- [ ] [Owner] Action item description
+
+## My Commitments
+Things "${micLabel}" agreed to do or follow up on.
+
+## Their Commitments
+Things "${systemLabel}" agreed to do or follow up on.
+
+## Problems / Blockers
+Any issues raised, noting who raised them.
+
+## Solutions / Proposals
+Solutions discussed, noting who proposed them.
+
+## Next Steps
+Agreed next steps and timeline.
+
+Write in plain UK English. Keep each section brief but complete. Do not invent details that aren't supported by the transcript. Attribute statements and commitments to the correct speaker.
+
+---
+
+TRANSCRIPT:
+${transcript}
+
+---
+
+Generate comprehensive speaker-aware meeting notes following the format above. Be concise but thorough.`;
+
+  const notes = await runLLM(prompt, progressCallback);
+  fs.writeFileSync(outputPath, notes, 'utf-8');
+  console.log(`Notes generated successfully: ${outputPath}`);
+  return outputPath;
+}
+
+/**
+ * Run a prompt through the best available LLM provider
+ *
+ * Strategy: Codex primary, Claude CLI fallback. If Codex is available it's
+ * tried first; on failure we fall through to Claude. If neither is installed
+ * an error with install instructions is thrown.
+ *
+ * @param {string} prompt
+ * @param {Function} [progressCallback]
+ * @returns {Promise<string>} Response text
+ */
+async function runLLM(prompt, progressCallback) {
+  const codexOk = isCodexAvailable();
+  const claudeOk = isClaudeAvailable();
+
+  if (!codexOk && !claudeOk) {
+    throw new Error(
+      'No AI summarisation provider found.\n' +
+      'Install one of:\n' +
+      '  Codex CLI:  npm install -g @anthropic-ai/codex\n' +
+      '  Claude CLI: npm install -g @anthropic-ai/claude-code'
+    );
+  }
+
+  if (progressCallback) progressCallback(10);
+
+  // Try Codex first if available
+  if (codexOk) {
+    try {
+      console.log('Using Codex CLI for summarisation...');
+      const result = await runCodex(prompt);
+      if (progressCallback) progressCallback(100);
+      return result;
+    } catch (err) {
+      if (claudeOk) {
+        console.warn(`Codex failed, falling back to Claude CLI: ${err.message}`);
+      } else {
+        throw new Error(`Codex summarisation failed: ${err.message}`);
+      }
     }
+  }
 
-    const data = await response.json();
-    return data.models || [];
-
+  // Claude fallback (or primary if Codex not installed)
+  console.log('Using Claude CLI for summarisation...');
+  try {
+    const result = await runClaude(prompt);
+    if (progressCallback) progressCallback(100);
+    return result;
   } catch (err) {
-    console.error('Failed to list Ollama models:', err);
-    return [];
+    throw new Error(`Claude summarisation failed: ${err.message}`);
   }
 }
 
 /**
  * Estimate note generation time
  *
- * Based on ~50 tokens/second for llama3.2 on Apple Silicon.
- * Average meeting notes are ~500-1000 tokens.
- *
  * @param {number} transcriptLength - Transcript length in characters
  * @returns {number} Estimated time in milliseconds
  */
 function estimateGenerationTime(transcriptLength) {
-  // Rough estimate: 4 chars per token, 50 tokens/sec
   const estimatedTokens = Math.ceil(transcriptLength / 4);
   const tokensPerSecond = 50;
   const seconds = Math.ceil(estimatedTokens / tokensPerSecond);
-
   return seconds * 1000;
 }
 
 module.exports = {
+  exportNotesToObsidian,
   generateNotes,
-  checkOllamaHealth,
-  listModels,
+  generateSessionNotes,
+  isCodexAvailable,
+  isClaudeAvailable,
   estimateGenerationTime,
-  OLLAMA_BASE_URL,
-  DEFAULT_MODEL
 };
