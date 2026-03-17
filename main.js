@@ -62,6 +62,9 @@ let levelMonitor = null;
 let trayIcon = null;
 let latestLevels = { system: 0, mic: 0 };
 
+// Track processing state so the renderer can catch up
+let processingState = null; // { path, stage, progress, message }
+
 // Track active processes for cleanup
 const activeProcesses = new Set();
 
@@ -620,10 +623,6 @@ async function handleStopRecording() {
       if (autoProcess) {
         processSession(result.sessionDir, result.duration).catch(err => {
           console.error('Auto-processing session failed (tray):', err);
-          showNotification('Processing Error', `Failed: ${err.message.split('\n')[0]}`, true);
-          if (settingsWindow && !settingsWindow.isDestroyed()) {
-            settingsWindow.webContents.send('processing:complete', { error: err.message });
-          }
         });
       }
     } else {
@@ -716,6 +715,29 @@ function stopLevelMonitor() {
 }
 
 /**
+ * Broadcast processing progress to the settings window and update global state
+ */
+function broadcastProgress(processingPath, stage, progress, message) {
+  processingState = { path: processingPath, stage, progress, message };
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.webContents.send('processing:progress', { path: processingPath, stage, progress, message });
+  }
+}
+
+/**
+ * Mark processing as complete, notify renderer and refresh recordings list
+ */
+function broadcastComplete(error) {
+  const completedPath = processingState ? processingState.path : null;
+  processingState = null;
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.webContents.send('processing:complete', error ? { error } : undefined);
+    // Tell the renderer to refresh its recordings list
+    settingsWindow.webContents.send('recordings:changed', { completedPath });
+  }
+}
+
+/**
  * Process a single-track recording: transcribe audio and generate meeting notes
  */
 async function processRecording(wavPath, duration) {
@@ -725,13 +747,7 @@ async function processRecording(wavPath, duration) {
     // Step 0: Trim silence from recording
     tray.setToolTip('Trimming silence...');
     console.log(`Trimming silence from: ${wavPath}`);
-    if (settingsWindow && !settingsWindow.isDestroyed()) {
-      settingsWindow.webContents.send('processing:progress', {
-        stage: 'Trimming',
-        progress: 0,
-        message: 'Trimming silence from recording...'
-      });
-    }
+    broadcastProgress(wavPath, 'Trimming', 0, 'Trimming silence from recording...');
 
     const trimResult = await trimSilence(wavPath, { registerProcess });
     if (trimResult.trimmed) {
@@ -746,27 +762,14 @@ async function processRecording(wavPath, duration) {
 
     const transcriptPath = await transcribe(wavPath, outputDir, (progress) => {
       tray.setToolTip(`Transcribing: ${progress}%`);
-      if (settingsWindow && !settingsWindow.isDestroyed()) {
-        settingsWindow.webContents.send('processing:progress', {
-          stage: 'Transcribing',
-          progress,
-          message: `Processing audio: ${progress}%`
-        });
-      }
+      broadcastProgress(wavPath, 'Transcribing', progress, `Processing audio: ${progress}%`);
     });
 
     console.log(`Transcription complete: ${transcriptPath}`);
 
     tray.setToolTip('Generating notes...');
     console.log(`Starting note generation from: ${transcriptPath}`);
-
-    if (settingsWindow && !settingsWindow.isDestroyed()) {
-      settingsWindow.webContents.send('processing:progress', {
-        stage: 'Summarising',
-        progress: 0,
-        message: 'Generating notes...'
-      });
-    }
+    broadcastProgress(wavPath, 'Summarising', 0, 'Generating notes...');
 
     let lastNoteUpdate = 0;
     const notesPath = await generateNotes(transcriptPath, (progress) => {
@@ -775,13 +778,7 @@ async function processRecording(wavPath, duration) {
       lastNoteUpdate = now;
 
       tray.setToolTip(`Generating notes... (${progress}%)`);
-      if (settingsWindow && !settingsWindow.isDestroyed()) {
-        settingsWindow.webContents.send('processing:progress', {
-          stage: 'Summarising',
-          progress: Math.min(95, progress),
-          message: `Generating notes... (${progress}%)`
-        });
-      }
+      broadcastProgress(wavPath, 'Summarising', Math.min(95, progress), `Generating notes... (${progress}%)`);
     });
 
     const obsidianPath = exportNotesToVault(notesPath, {
@@ -793,19 +790,14 @@ async function processRecording(wavPath, duration) {
     console.log(`Obsidian note exported: ${obsidianPath}`);
 
     tray.setToolTip('Notes4Chris');
-
-    if (settingsWindow && !settingsWindow.isDestroyed()) {
-      settingsWindow.webContents.send('processing:complete');
-    }
+    broadcastComplete();
 
     showNotification('Processing Complete', 'Meeting notes generated successfully!');
 
   } catch (err) {
     console.error('Processing failed:', err);
     tray.setToolTip('Notes4Chris');
-    if (settingsWindow && !settingsWindow.isDestroyed()) {
-      settingsWindow.webContents.send('processing:complete');
-    }
+    broadcastComplete(err.message);
     showNotification('Processing Error', `Failed: ${err.message.split('\n')[0]}`, true);
   }
 }
@@ -824,13 +816,7 @@ async function processSession(sessionDir, duration) {
     // Step 0: Trim silence from both tracks
     tray.setToolTip('Trimming silence...');
     console.log(`Trimming silence from session tracks: ${sessionDir}`);
-    if (settingsWindow && !settingsWindow.isDestroyed()) {
-      settingsWindow.webContents.send('processing:progress', {
-        stage: 'Trimming',
-        progress: 0,
-        message: 'Trimming silence from audio tracks...'
-      });
-    }
+    broadcastProgress(sessionDir, 'Trimming', 0, 'Trimming silence from audio tracks...');
 
     const systemFile = path.join(sessionDir, manifest.tracks.system.file);
     const micFile = path.join(sessionDir, manifest.tracks.mic.file);
@@ -862,13 +848,7 @@ async function processSession(sessionDir, duration) {
 
     const transcripts = await transcribeSession(sessionDir, outputDir, (progress) => {
       tray.setToolTip(`Transcribing: ${progress}%`);
-      if (settingsWindow && !settingsWindow.isDestroyed()) {
-        settingsWindow.webContents.send('processing:progress', {
-          stage: 'Transcribing',
-          progress,
-          message: `Processing dual tracks: ${progress}%`
-        });
-      }
+      broadcastProgress(sessionDir, 'Transcribing', progress, `Processing dual tracks: ${progress}%`);
     }, { useSharedTranscript: store.get('useSharedTranscript') });
 
     console.log(`Transcription complete. Merged: ${transcripts.mergedTranscript}`);
@@ -876,14 +856,7 @@ async function processSession(sessionDir, duration) {
     // Step 2: Generate speaker-aware notes
     tray.setToolTip('Generating speaker-aware notes...');
     console.log(`Starting note generation from merged transcript`);
-
-    if (settingsWindow && !settingsWindow.isDestroyed()) {
-      settingsWindow.webContents.send('processing:progress', {
-        stage: 'Summarising',
-        progress: 0,
-        message: 'Generating speaker-aware notes...'
-      });
-    }
+    broadcastProgress(sessionDir, 'Summarising', 0, 'Generating speaker-aware notes...');
 
     // Re-read manifest (updated by transcribeSession)
     const updatedManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
@@ -895,13 +868,7 @@ async function processSession(sessionDir, duration) {
       lastSummaryUpdate = now;
 
       tray.setToolTip(`Generating notes... (${progress}%)`);
-      if (settingsWindow && !settingsWindow.isDestroyed()) {
-        settingsWindow.webContents.send('processing:progress', {
-          stage: 'Summarising',
-          progress: Math.min(95, progress),
-          message: `Generating notes... (${progress}%)`
-        });
-      }
+      broadcastProgress(sessionDir, 'Summarising', Math.min(95, progress), `Generating notes... (${progress}%)`);
     });
 
     if (!updatedManifest.processing) {
@@ -923,19 +890,14 @@ async function processSession(sessionDir, duration) {
     console.log(`Obsidian note exported: ${obsidianPath}`);
 
     tray.setToolTip('Notes4Chris');
-
-    if (settingsWindow && !settingsWindow.isDestroyed()) {
-      settingsWindow.webContents.send('processing:complete');
-    }
+    broadcastComplete();
 
     showNotification('Processing Complete', 'Speaker-aware meeting notes generated!');
 
   } catch (err) {
     console.error('Session processing failed:', err);
     tray.setToolTip('Notes4Chris');
-    if (settingsWindow && !settingsWindow.isDestroyed()) {
-      settingsWindow.webContents.send('processing:complete');
-    }
+    broadcastComplete(err.message);
     showNotification('Processing Error', `Failed: ${err.message.split('\n')[0]}`, true);
 
     // Log error to manifest so failed sessions are identifiable
@@ -1210,6 +1172,10 @@ ipcMain.handle('recording:status', async () => {
   }
 
   return { isRecording: false };
+});
+
+ipcMain.handle('processing:status', async () => {
+  return processingState; // null if idle, { path, stage, progress, message } if active
 });
 
 // Session Reprocessing
@@ -1514,13 +1480,7 @@ ipcMain.handle('process:transcribe', async (event, wavPath) => {
   try {
     const outputDir = store.get('outputDirectory');
     const transcriptPath = await transcribe(wavPath, outputDir, (progress) => {
-      if (BrowserWindow.getAllWindows().length > 0) {
-        BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
-          stage: 'Transcribing',
-          progress,
-          message: `Processing audio: ${progress}%`
-        });
-      }
+      broadcastProgress(wavPath, 'Transcribing', progress, `Processing audio: ${progress}%`);
     });
 
     return { success: true, transcriptPath };
@@ -1533,13 +1493,7 @@ ipcMain.handle('process:transcribe', async (event, wavPath) => {
 ipcMain.handle('process:summarise', async (event, transcriptPath) => {
   try {
     const notesPath = await generateNotes(transcriptPath, (progress) => {
-      if (BrowserWindow.getAllWindows().length > 0) {
-        BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
-          stage: 'Summarising',
-          progress: Math.min(95, progress),
-          message: `Generating notes... (${progress}%)`
-        });
-      }
+      broadcastProgress(transcriptPath, 'Summarising', Math.min(95, progress), `Generating notes... (${progress}%)`);
     });
 
     const obsidianPath = exportNotesToVault(notesPath, {
@@ -1565,33 +1519,15 @@ ipcMain.handle('process:full', async (event, wavPathOrSessionDir) => {
       const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
 
       const transcripts = await transcribeSession(wavPathOrSessionDir, outputDir, (progress) => {
-        if (BrowserWindow.getAllWindows().length > 0) {
-          BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
-            stage: 'Transcribing',
-            progress,
-            message: `Processing dual tracks: ${progress}%`
-          });
-        }
+        broadcastProgress(wavPathOrSessionDir, 'Transcribing', progress, `Processing dual tracks: ${progress}%`);
       });
 
       const updatedManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
 
-      if (BrowserWindow.getAllWindows().length > 0) {
-        BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
-          stage: 'Summarising',
-          progress: 0,
-          message: 'Generating speaker-aware notes...'
-        });
-      }
+      broadcastProgress(wavPathOrSessionDir, 'Summarising', 0, 'Generating speaker-aware notes...');
 
       const notesPath = await generateSessionNotes(transcripts.mergedTranscript, updatedManifest, (progress) => {
-        if (BrowserWindow.getAllWindows().length > 0) {
-          BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
-            stage: 'Summarising',
-            progress: Math.min(95, progress),
-            message: `Generating notes... (${progress}%)`
-          });
-        }
+        broadcastProgress(wavPathOrSessionDir, 'Summarising', Math.min(95, progress), `Generating notes... (${progress}%)`);
       });
 
       if (!updatedManifest.processing) {
@@ -1608,39 +1544,19 @@ ipcMain.handle('process:full', async (event, wavPathOrSessionDir) => {
       updatedManifest.processing.obsidianExport = obsidianPath;
       fs.writeFileSync(manifestPath, JSON.stringify(updatedManifest, null, 2), 'utf-8');
 
-      if (BrowserWindow.getAllWindows().length > 0) {
-        BrowserWindow.getAllWindows()[0].webContents.send('processing:complete');
-      }
+      broadcastComplete();
 
       return { success: true, mergedTranscript: transcripts.mergedTranscript, notesPath, obsidianPath };
     } else {
       // Single WAV file - use original pipeline
       const transcriptPath = await transcribe(wavPathOrSessionDir, outputDir, (progress) => {
-        if (BrowserWindow.getAllWindows().length > 0) {
-          BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
-            stage: 'Transcribing',
-            progress,
-            message: `Processing audio: ${progress}%`
-          });
-        }
+        broadcastProgress(wavPathOrSessionDir, 'Transcribing', progress, `Processing audio: ${progress}%`);
       });
 
-      if (BrowserWindow.getAllWindows().length > 0) {
-        BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
-          stage: 'Summarising',
-          progress: 0,
-          message: 'Generating notes...'
-        });
-      }
+      broadcastProgress(wavPathOrSessionDir, 'Summarising', 0, 'Generating notes...');
 
       const notesPath = await generateNotes(transcriptPath, (progress) => {
-        if (BrowserWindow.getAllWindows().length > 0) {
-          BrowserWindow.getAllWindows()[0].webContents.send('processing:progress', {
-            stage: 'Summarising',
-            progress: Math.min(95, progress),
-            message: `Generating notes... (${progress}%)`
-          });
-        }
+        broadcastProgress(wavPathOrSessionDir, 'Summarising', Math.min(95, progress), `Generating notes... (${progress}%)`);
       });
 
       const obsidianPath = exportNotesToVault(notesPath, {
@@ -1648,14 +1564,13 @@ ipcMain.handle('process:full', async (event, wavPathOrSessionDir) => {
         startTime: getFileStartTime(wavPathOrSessionDir)
       });
 
-      if (BrowserWindow.getAllWindows().length > 0) {
-        BrowserWindow.getAllWindows()[0].webContents.send('processing:complete');
-      }
+      broadcastComplete();
 
       return { success: true, transcriptPath, notesPath, obsidianPath };
     }
   } catch (err) {
     console.error('IPC process:full failed:', err);
+    broadcastComplete(err.message);
     return { success: false, error: err.message };
   }
 });

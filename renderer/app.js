@@ -11,6 +11,7 @@ const api = window.meetingRecorder;
 // State
 let currentSettings = {};
 let recordings = [];
+let currentProcessingPath = null; // Path of the recording/session currently being processed
 
 /**
  * ============================================
@@ -40,6 +41,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Check if a recording is already in progress
   await checkRecordingStatus();
+
+  // Check if processing is already in progress (catch up with background work)
+  await checkProcessingStatus();
 });
 
 /**
@@ -242,8 +246,23 @@ function renderRecordingItem(rec) {
   const errorBadge = rec.processingError ? `<span class="badge badge-error" title="${rec.processingError}">Failed</span>` : '';
   const showReprocess = rec.isDualTrack && (!rec.summarised || rec.processingError);
 
+  // Check if this recording is currently being processed
+  const isProcessing = currentProcessingPath && (
+    rec.filepath === currentProcessingPath ||
+    (rec.filepath && currentProcessingPath.includes(rec.filename))
+  );
+
+  let statusBadge;
+  if (isProcessing) {
+    statusBadge = '<span class="badge badge-processing"><span class="badge-spinner"></span>Processing\u2026</span>';
+  } else if (rec.transcribed) {
+    statusBadge = '<span class="badge badge-success">Transcribed</span>';
+  } else {
+    statusBadge = '<span class="badge badge-warning">Not transcribed</span>';
+  }
+
   return `
-    <div class="recording-item">
+    <div class="recording-item${isProcessing ? ' is-processing' : ''}" data-filepath="${rec.filepath || ''}">
       <div class="recording-info">
         <div class="recording-name">${rec.filename}</div>
         <div class="recording-meta">
@@ -253,7 +272,7 @@ function renderRecordingItem(rec) {
       </div>
       <div class="recording-badges">
         ${dualBadge}
-        ${rec.transcribed ? '<span class="badge badge-success">Transcribed</span>' : '<span class="badge badge-warning">Not transcribed</span>'}
+        ${statusBadge}
         ${rec.summarised ? '<span class="badge badge-success">Summarised</span>' : ''}
         ${errorBadge}
       </div>
@@ -411,12 +430,22 @@ function setupIPCListeners() {
 
   // Listen for processing progress
   api.onProcessingProgress((data) => {
+    currentProcessingPath = data.path || null;
     showProcessingOverlay(data.stage, data.message, data.progress);
+    // Update the badge on the recording item being processed
+    updateProcessingBadge();
   });
 
   // Listen for processing complete
   api.onProcessingComplete(() => {
+    currentProcessingPath = null;
     hideProcessingOverlay();
+  });
+
+  // Listen for recordings list changes (auto-refresh after processing completes)
+  api.onRecordingsChanged(() => {
+    loadRecordings();
+    loadStorageStats();
   });
 
   // Listen for errors
@@ -492,6 +521,20 @@ async function checkRecordingStatus() {
     }
   } catch (err) {
     console.error('Failed to check recording status:', err);
+  }
+}
+
+async function checkProcessingStatus() {
+  try {
+    const status = await api.getProcessingStatus();
+    if (status) {
+      currentProcessingPath = status.path;
+      showProcessingOverlay(status.stage, status.message, status.progress);
+      // Re-render recordings to show "Processing..." badge
+      await loadRecordings();
+    }
+  } catch (err) {
+    console.error('Failed to check processing status:', err);
   }
 }
 
@@ -637,10 +680,13 @@ async function handleOpenFile(filepath) {
 
 async function handleProcessRecording(wavPath) {
   try {
+    currentProcessingPath = wavPath;
     showProcessingOverlay('Processing', 'Starting transcription...', 0);
+    updateProcessingBadge();
 
     const result = await api.processRecording(wavPath);
 
+    currentProcessingPath = null;
     hideProcessingOverlay();
 
     if (result.success) {
@@ -648,9 +694,11 @@ async function handleProcessRecording(wavPath) {
       await loadRecordings();
     } else {
       showError('Processing failed: ' + result.error);
+      await loadRecordings();
     }
   } catch (err) {
     console.error('Failed to process recording:', err);
+    currentProcessingPath = null;
     hideProcessingOverlay();
     showError('Processing failed');
   }
@@ -658,7 +706,9 @@ async function handleProcessRecording(wavPath) {
 
 async function handleReprocessSession(sessionDir) {
   try {
+    currentProcessingPath = sessionDir;
     showProcessingOverlay('Reprocessing', 'Starting reprocessing...', 0);
+    updateProcessingBadge();
 
     const result = await api.reprocessSession(sessionDir);
 
@@ -742,6 +792,28 @@ async function runPreflightCheck() {
  * UI Helpers
  * ============================================
  */
+
+function updateProcessingBadge() {
+  // Update recording items to reflect current processing state without full re-render
+  const items = document.querySelectorAll('.recording-item[data-filepath]');
+  items.forEach(item => {
+    const filepath = item.dataset.filepath;
+    const badges = item.querySelector('.recording-badges');
+    if (!badges) return;
+
+    const isProcessing = currentProcessingPath && (
+      filepath === currentProcessingPath ||
+      (filepath && currentProcessingPath.includes(item.querySelector('.recording-name')?.textContent))
+    );
+
+    const existingBadge = badges.querySelector('.badge-processing, .badge-warning');
+    if (isProcessing && existingBadge && !existingBadge.classList.contains('badge-processing')) {
+      // Swap "Not transcribed" for "Processing..."
+      existingBadge.outerHTML = '<span class="badge badge-processing"><span class="badge-spinner"></span>Processing\u2026</span>';
+      item.classList.add('is-processing');
+    }
+  });
+}
 
 function showProcessingOverlay(stage, message, progress) {
   const overlay = document.getElementById('processing-overlay');

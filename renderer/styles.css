@@ -799,6 +799,29 @@ a {
   background: rgba(255, 69, 58, 0.12);
 }
 
+.badge-processing {
+  color: #5ac8fa;
+  background: rgba(90, 200, 250, 0.12);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.badge-spinner {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(90, 200, 250, 0.25);
+  border-top-color: #5ac8fa;
+  animation: spin 0.8s linear infinite;
+}
+
+.recording-item.is-processing {
+  border-color: rgba(90, 200, 250, 0.15);
+  background: rgba(90, 200, 250, 0.04);
+}
+
 .badge-dual {
   color: var(--accent);
   background: rgba(var(--accent-rgb), 0.14);

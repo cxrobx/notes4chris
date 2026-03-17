@@ -44,6 +44,7 @@ contextBridge.exposeInMainWorld('meetingRecorder', {
   generateNotes: (transcriptPath) => ipcRenderer.invoke('process:summarise', transcriptPath),
   processRecording: (wavPath) => ipcRenderer.invoke('process:full', wavPath),
   reprocessSession: (sessionDir) => ipcRenderer.invoke('session:reprocess', sessionDir),
+  getProcessingStatus: () => ipcRenderer.invoke('processing:status'),
 
   // ============================================
   // Audio Configuration
@@ -97,6 +98,10 @@ contextBridge.exposeInMainWorld('meetingRecorder', {
 
   onNotification: (callback) => {
     ipcRenderer.on('notification', (event, data) => callback(data));
+  },
+
+  onRecordingsChanged: (callback) => {
+    ipcRenderer.on('recordings:changed', (event, data) => callback(data));
   },
 
   onCompanionModeStatus: (callback) => {
