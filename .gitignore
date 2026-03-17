@@ -45,6 +45,7 @@ whisper.cpp/
 
 # Tool configs
 .serena/
+.claude/settings.local.json
 
 # Swift build artifacts
 native/*/.build/

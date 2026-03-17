@@ -219,6 +219,10 @@ class Recorder {
         return;
       }
 
+      // Mark as stopped immediately so tray menu can update
+      const duration = Date.now() - this.startTime;
+      this.isRecording = false;
+
       // Clear SCK health check if pending
       if (this._sckHealthTimeout) {
         clearTimeout(this._sckHealthTimeout);
@@ -231,10 +235,11 @@ class Recorder {
         this.sizeInterval = null;
       }
 
-      // Wait for process to finish writing
-      this.captureProcess.on('exit', (code) => {
-        this.isRecording = false;
-        const duration = Date.now() - this.startTime;
+      let settled = false;
+
+      const finish = () => {
+        if (settled) return;
+        settled = true;
 
         // Verify file exists and get size
         if (!fs.existsSync(this.currentFile)) {
@@ -255,14 +260,26 @@ class Recorder {
           duration: duration,
           size: stats.size
         });
-      });
+      };
+
+      // Wait for process to finish writing
+      this.captureProcess.on('exit', () => finish());
 
       // Send SIGTERM to gracefully stop
       try {
         this.captureProcess.kill('SIGTERM');
       } catch (err) {
         reject(new Error(`Failed to stop recording: ${err.message}`));
+        return;
       }
+
+      // Timeout: if process doesn't exit after 10s, SIGKILL and resolve
+      setTimeout(() => {
+        if (settled) return;
+        console.warn('Recorder process did not exit after 10s — sending SIGKILL');
+        try { this.captureProcess.kill('SIGKILL'); } catch { /* already dead */ }
+        setTimeout(() => finish(), 200);
+      }, 10000);
     });
   }
 
@@ -622,34 +639,33 @@ class DualTrackRecorder {
         this._sckHealthTimeout = null;
       }
 
+      // Helper: stop a process with a 10s timeout before SIGKILL
+      const stopWithTimeout = (proc, label) => new Promise((res) => {
+        if (!proc) { res(label); return; }
+
+        let done = false;
+        proc.on('exit', () => { if (!done) { done = true; res(label); } });
+
+        try {
+          proc.kill('SIGTERM');
+        } catch (err) {
+          console.error(`Failed to stop ${label} process:`, err.message);
+          done = true; res(label); return;
+        }
+
+        setTimeout(() => {
+          if (done) return;
+          console.warn(`${label} process did not exit after 10s — sending SIGKILL`);
+          try { proc.kill('SIGKILL'); } catch { /* already dead */ }
+          setTimeout(() => { if (!done) { done = true; res(label); } }, 200);
+        }, 10000);
+      });
+
       // Kill both processes and wait for them to settle
-      const stopPromises = [];
-
-      // Stop system process
-      if (this.systemProcess) {
-        stopPromises.push(new Promise((res) => {
-          this.systemProcess.on('exit', () => res('system'));
-          try {
-            this.systemProcess.kill('SIGTERM');
-          } catch (err) {
-            console.error('Failed to stop system process:', err.message);
-            res('system');
-          }
-        }));
-      }
-
-      // Stop mic process
-      if (this.micProcess) {
-        stopPromises.push(new Promise((res) => {
-          this.micProcess.on('exit', () => res('mic'));
-          try {
-            this.micProcess.kill('SIGTERM');
-          } catch (err) {
-            console.error('Failed to stop mic process:', err.message);
-            res('mic');
-          }
-        }));
-      }
+      const stopPromises = [
+        stopWithTimeout(this.systemProcess, 'system'),
+        stopWithTimeout(this.micProcess, 'mic')
+      ];
 
       // Wait for both to finish (partial success is OK)
       Promise.allSettled(stopPromises).then(() => {

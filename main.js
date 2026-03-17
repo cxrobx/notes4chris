@@ -27,6 +27,7 @@ const { transcribe, transcribeSession, verifyInstallation: verifyWhisper } = req
 const { generateNotes, generateSessionNotes, exportNotesToObsidian, isCodexAvailable, isClaudeAvailable } = require('./services/summariser');
 const { ensureDirectoryStructure, cleanupOldRecordings, getStorageStats } = require('./services/fileManager');
 const { listInputDevices, findDefaultMicrophone, verifyInputDevice, findBlackHoleDevice, checkSckAvailable } = require('./utils/audioDevices');
+const { trimSilence } = require('./utils/audioProcessing');
 const { checkForProvider } = require('./services/companionTranscript');
 
 const OBSIDIAN_VAULT_DIRECTORY = path.join(app.getPath('documents'), 'CX');
@@ -588,28 +589,33 @@ async function handleStopRecording() {
   try {
     stopLevelMonitor();
 
-    if (useDual) {
-      const result = await dualRecorder.stop();
+    // Clear interval and update menu immediately (isRecording is set to false
+    // synchronously in both Recorder.stop() and DualTrackRecorder.stop())
+    if (statusUpdateInterval) {
+      clearInterval(statusUpdateInterval);
+      statusUpdateInterval = null;
+    }
 
+    // Start stop but don't await yet — update UI first
+    const stopPromise = useDual ? dualRecorder.stop() : recorder.stop();
+
+    updateTrayMenu();
+
+    // Notify settings window immediately
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      settingsWindow.webContents.send('recording:update', { state: 'stopped' });
+      settingsWindow.webContents.send('companion-mode-status', { active: false });
+    }
+
+    // Now await the actual stop result for logging and auto-processing
+    const result = await stopPromise;
+
+    if (useDual) {
       console.log(`Dual recording stopped: ${result.sessionDir}`);
       console.log(`Duration: ${formatDuration(result.duration)}`);
       console.log(`System: ${(result.systemSize / (1024 * 1024)).toFixed(2)} MB`);
       console.log(`Mic: ${(result.micSize / (1024 * 1024)).toFixed(2)} MB`);
 
-      if (statusUpdateInterval) {
-        clearInterval(statusUpdateInterval);
-        statusUpdateInterval = null;
-      }
-
-      updateTrayMenu();
-
-      // Notify settings window
-      if (settingsWindow && !settingsWindow.isDestroyed()) {
-        settingsWindow.webContents.send('recording:update', { state: 'stopped' });
-        settingsWindow.webContents.send('companion-mode-status', { active: false });
-      }
-
-      // Process session if auto-process is enabled
       const autoProcess = store.get('autoProcess');
       if (autoProcess) {
         processSession(result.sessionDir, result.duration).catch(err => {
@@ -621,24 +627,9 @@ async function handleStopRecording() {
         });
       }
     } else {
-      const result = await recorder.stop();
-
       console.log(`Recording stopped: ${result.filepath}`);
       console.log(`Duration: ${formatDuration(result.duration)}`);
       console.log(`Size: ${(result.size / (1024 * 1024)).toFixed(2)} MB`);
-
-      if (statusUpdateInterval) {
-        clearInterval(statusUpdateInterval);
-        statusUpdateInterval = null;
-      }
-
-      updateTrayMenu();
-
-      // Notify settings window
-      if (settingsWindow && !settingsWindow.isDestroyed()) {
-        settingsWindow.webContents.send('recording:update', { state: 'stopped' });
-        settingsWindow.webContents.send('companion-mode-status', { active: false });
-      }
 
       const autoProcess = store.get('autoProcess');
       if (autoProcess) {
@@ -651,6 +642,18 @@ async function handleStopRecording() {
 
   } catch (err) {
     console.error('Failed to stop recording:', err);
+
+    // Ensure UI is updated even on error
+    if (statusUpdateInterval) {
+      clearInterval(statusUpdateInterval);
+      statusUpdateInterval = null;
+    }
+    updateTrayMenu();
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      settingsWindow.webContents.send('recording:update', { state: 'stopped' });
+      settingsWindow.webContents.send('companion-mode-status', { active: false });
+    }
+    showNotification('Recording Error', `Failed to stop: ${err.message}`, true);
   }
 }
 
@@ -719,6 +722,25 @@ async function processRecording(wavPath, duration) {
   const outputDir = store.get('outputDirectory');
 
   try {
+    // Step 0: Trim silence from recording
+    tray.setToolTip('Trimming silence...');
+    console.log(`Trimming silence from: ${wavPath}`);
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      settingsWindow.webContents.send('processing:progress', {
+        stage: 'Trimming',
+        progress: 0,
+        message: 'Trimming silence from recording...'
+      });
+    }
+
+    const trimResult = await trimSilence(wavPath, { registerProcess });
+    if (trimResult.trimmed) {
+      console.log(`Silence trimmed: saved ${(trimResult.savedBytes / 1024).toFixed(0)} KB`);
+    } else if (trimResult.allSilence) {
+      console.warn('Recording appears to be all silence');
+    }
+
+    // Step 1: Transcribe
     tray.setToolTip('Transcribing audio...');
     console.log(`Starting transcription for: ${wavPath}`);
 
@@ -798,6 +820,41 @@ async function processSession(sessionDir, duration) {
     // Read manifest
     const manifestPath = path.join(sessionDir, 'manifest.json');
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+
+    // Step 0: Trim silence from both tracks
+    tray.setToolTip('Trimming silence...');
+    console.log(`Trimming silence from session tracks: ${sessionDir}`);
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      settingsWindow.webContents.send('processing:progress', {
+        stage: 'Trimming',
+        progress: 0,
+        message: 'Trimming silence from audio tracks...'
+      });
+    }
+
+    const systemFile = path.join(sessionDir, manifest.tracks.system.file);
+    const micFile = path.join(sessionDir, manifest.tracks.mic.file);
+    const trimOpts = { registerProcess };
+
+    const [systemTrim, micTrim] = await Promise.all([
+      trimSilence(systemFile, trimOpts),
+      trimSilence(micFile, trimOpts)
+    ]);
+
+    // Log trim results
+    if (systemTrim.trimmed) {
+      console.log(`System track: trimmed ${(systemTrim.savedBytes / 1024).toFixed(0)} KB silence`);
+      manifest.tracks.system.silenceTrimmed = systemTrim;
+    }
+    if (micTrim.trimmed) {
+      console.log(`Mic track: trimmed ${(micTrim.savedBytes / 1024).toFixed(0)} KB silence`);
+      manifest.tracks.mic.silenceTrimmed = micTrim;
+    }
+    if (systemTrim.allSilence) console.warn('System track appears to be all silence');
+    if (micTrim.allSilence) console.warn('Mic track appears to be all silence');
+
+    // Update manifest with trim stats
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf-8');
 
     // Step 1: Transcribe both tracks
     tray.setToolTip('Transcribing dual tracks...');
