@@ -7,6 +7,40 @@ const LLM_TIMEOUT = 300000; // 5 minutes (large transcripts need more time)
 const OBSIDIAN_FILENAME_LIMIT = 120;
 
 /**
+ * Format a date for inclusion in an LLM prompt.
+ *
+ * Accepts an ISO string or a directory-name timestamp like "2026-03-17_18-02-27".
+ * Returns e.g. "Monday 17 March 2026 at 18:02" (UK style) or null on failure.
+ */
+function formatDateForPrompt(value) {
+  if (!value) return null;
+
+  // Normalise directory-name timestamps: "2026-03-17_18-02-27" → "2026-03-17T18:02:27"
+  const normalised = String(value).replace(
+    /^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})$/,
+    '$1T$2:$3:$4'
+  );
+
+  const date = new Date(normalised);
+  if (Number.isNaN(date.getTime())) return null;
+
+  const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const monthNames = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+  ];
+
+  const dayName = dayNames[date.getDay()];
+  const day = date.getDate();
+  const month = monthNames[date.getMonth()];
+  const year = date.getFullYear();
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+
+  return `${dayName} ${day} ${month} ${year} at ${hours}:${minutes}`;
+}
+
+/**
  * Check if Codex CLI is available
  *
  * @returns {boolean}
@@ -375,11 +409,23 @@ async function generateNotes(transcriptPath, progressCallback) {
 
   console.log(`Generating notes from transcript: ${transcriptPath}`);
 
-  const prompt = `You create clear and structured meeting notes. Read the transcript and produce well-organised notes with accurate detail and concise wording. Infer the meeting date if it's mentioned or implied.
+  // Try to extract the recording date from the session directory name (e.g. "2026-03-17_18-02-27_session")
+  const dirMatch = transcriptPath.match(/(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})_session/);
+  const formattedDate = dirMatch ? formatDateForPrompt(dirMatch[1]) : null;
+
+  const dateInstruction = formattedDate
+    ? `This meeting was recorded on ${formattedDate}. Use this date in the title.`
+    : `Infer the meeting date if it's mentioned or implied.`;
+
+  const dateTitle = formattedDate
+    ? `Meeting Notes [${formattedDate.replace(/^\w+ /, '').replace(/ at .*$/, '')}]`
+    : 'Meeting Notes [Include inferred date]';
+
+  const prompt = `You create clear and structured meeting notes. Read the transcript and produce well-organised notes with accurate detail and concise wording. ${dateInstruction}
 
 Use the following sections when they apply:
 
-Meeting Notes [Include inferred date]
+${dateTitle}
 Action Items
 Meeting Purpose
 Key Takeaways
@@ -445,15 +491,24 @@ async function generateSessionNotes(mergedTranscriptPath, manifest, progressCall
     contextBlock += '\nUse this context to improve accuracy — use real participant names where possible, and reference the agenda topics.\n';
   }
 
+  // Format the recording date from the manifest
+  const formattedDate = formatDateForPrompt(manifest.startTime);
+  const dateInstruction = formattedDate
+    ? `This meeting was recorded on ${formattedDate}. Use this date in the title.`
+    : `Infer the meeting date if it's mentioned or implied.`;
+  const dateTitle = formattedDate
+    ? `Meeting Notes [${formattedDate.replace(/^\w+ /, '').replace(/ at .*$/, '')}]`
+    : 'Meeting Notes [Include inferred date]';
+
   const prompt = `You create clear and structured meeting notes from a dual-track transcript. The transcript has two speakers:
 - "${systemLabel}" — the remote participant(s) heard through system audio
 - "${micLabel}" — the local user speaking into their microphone
 ${contextBlock}
-Read the transcript and produce well-organised, speaker-aware notes with accurate detail and concise wording. Infer the meeting date if it's mentioned or implied.
+Read the transcript and produce well-organised, speaker-aware notes with accurate detail and concise wording. ${dateInstruction}
 
 Use the following sections when they apply:
 
-## Meeting Notes [Include inferred date]
+## ${dateTitle}
 
 ## Participants
 List the speakers identified in the transcript.
