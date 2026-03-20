@@ -21,6 +21,7 @@ DMG="dist/Notes4Chris-1.0.0-arm64.dmg"
 VOLUME="/Volumes/Notes4Chris 1.0.0-arm64"
 
 hdiutil attach "$DMG" -nobrowse -quiet
+rm -rf "/Applications/Notes4Chris.app"
 cp -R "$VOLUME/Notes4Chris.app" /Applications/
 hdiutil detach "$VOLUME" -quiet
 
