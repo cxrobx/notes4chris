@@ -12,6 +12,7 @@ const api = window.meetingRecorder;
 let currentSettings = {};
 let recordings = [];
 let currentProcessingPath = null; // Path of the recording/session currently being processed
+let manualProcessingActive = false; // True when user explicitly clicked Process/Reprocess (show overlay)
 
 /**
  * ============================================
@@ -431,15 +432,23 @@ function setupIPCListeners() {
   // Listen for processing progress
   api.onProcessingProgress((data) => {
     currentProcessingPath = data.path || null;
-    showProcessingOverlay(data.stage, data.message, data.progress);
-    // Update the badge on the recording item being processed
+    // Only show the full-page overlay if user explicitly triggered processing (not background auto-process)
+    if (manualProcessingActive) {
+      showProcessingOverlay(data.stage, data.message, data.progress);
+    }
+    // Always update the inline badge on the recording item
     updateProcessingBadge();
   });
 
   // Listen for processing complete
-  api.onProcessingComplete(() => {
+  api.onProcessingComplete((data) => {
     currentProcessingPath = null;
+    manualProcessingActive = false;
     hideProcessingOverlay();
+    // Show error toast if processing failed
+    if (data && data.error) {
+      showError(`Processing failed: ${data.error.split('\n')[0]}`);
+    }
   });
 
   // Listen for recordings list changes (auto-refresh after processing completes)
@@ -529,8 +538,7 @@ async function checkProcessingStatus() {
     const status = await api.getProcessingStatus();
     if (status) {
       currentProcessingPath = status.path;
-      showProcessingOverlay(status.stage, status.message, status.progress);
-      // Re-render recordings to show "Processing..." badge
+      // Re-render recordings to show "Processing..." badge (no overlay for background processing)
       await loadRecordings();
     }
   } catch (err) {
@@ -681,12 +689,14 @@ async function handleOpenFile(filepath) {
 async function handleProcessRecording(wavPath) {
   try {
     currentProcessingPath = wavPath;
+    manualProcessingActive = true;
     showProcessingOverlay('Processing', 'Starting transcription...', 0);
     updateProcessingBadge();
 
     const result = await api.processRecording(wavPath);
 
     currentProcessingPath = null;
+    manualProcessingActive = false;
     hideProcessingOverlay();
 
     if (result.success) {
@@ -699,6 +709,7 @@ async function handleProcessRecording(wavPath) {
   } catch (err) {
     console.error('Failed to process recording:', err);
     currentProcessingPath = null;
+    manualProcessingActive = false;
     hideProcessingOverlay();
     showError('Processing failed');
   }
@@ -707,7 +718,6 @@ async function handleProcessRecording(wavPath) {
 async function handleReprocessSession(sessionDir) {
   try {
     currentProcessingPath = sessionDir;
-    showProcessingOverlay('Reprocessing', 'Starting reprocessing...', 0);
     updateProcessingBadge();
 
     const result = await api.reprocessSession(sessionDir);

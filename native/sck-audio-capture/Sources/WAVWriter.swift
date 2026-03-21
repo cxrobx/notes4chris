@@ -18,6 +18,10 @@ final class WAVWriter {
     private var dataSize: UInt32 = 0
     private var isFinalised = false
     private var formatLogged = false
+    private var lastHeaderUpdate: UInt32 = 0
+    /// Update the WAV header every ~1 MB of audio data so the file remains
+    /// readable even if the process is killed without a clean shutdown.
+    private let headerUpdateInterval: UInt32 = 1_048_576
 
     init(outputPath: String, sampleRate: Int, channels: Int, bitDepth: Int) throws {
         self.filePath = outputPath
@@ -125,13 +129,28 @@ final class WAVWriter {
 
         fileHandle.write(int16Data)
         dataSize += UInt32(int16Data.count)
+
+        // Periodically patch the WAV header so the file stays readable
+        // even if the process is killed without calling finalise()
+        if dataSize - lastHeaderUpdate >= headerUpdateInterval {
+            patchHeader()
+            lastHeaderUpdate = dataSize
+        }
     }
 
     /// Finalise the WAV file by patching the header size fields
     func finalise() throws {
         guard !isFinalised else { return }
         isFinalised = true
+        patchHeader()
+        fileHandle.closeFile()
+    }
 
+    /// Patch the RIFF and data chunk size fields in the WAV header
+    /// to reflect the current amount of audio data written.
+    /// Safe to call repeatedly during recording.
+    private func patchHeader() {
+        let currentOffset = fileHandle.offsetInFile
         let fileSize = dataSize + 36
 
         // Patch file size at offset 4
@@ -142,7 +161,8 @@ final class WAVWriter {
         fileHandle.seek(toFileOffset: 40)
         fileHandle.write(uint32Data(dataSize))
 
-        fileHandle.closeFile()
+        // Seek back to end so subsequent writes go to the right place
+        fileHandle.seek(toFileOffset: currentOffset)
     }
 
     // MARK: - Private

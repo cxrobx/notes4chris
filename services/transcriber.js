@@ -292,9 +292,15 @@ async function transcribeSession(sessionDir, outputDir, progressCallback, option
     }
   };
 
-  const systemPromise = manifest.tracks.system.status === 'complete'
+  // Check if tracks are usable — trust actual file content over manifest status
+  // (manifest status may be stale from an unclean shutdown)
+  const systemWav = path.join(sessionDir, manifest.tracks.system.file);
+  const micWav = path.join(sessionDir, manifest.tracks.mic.file);
+  const systemUsable = fs.existsSync(systemWav) && fs.statSync(systemWav).size > 44;
+  const micUsable = fs.existsSync(micWav) && fs.statSync(micWav).size > 44;
+
+  const systemPromise = systemUsable
     ? (async () => {
-        const systemWav = path.join(sessionDir, manifest.tracks.system.file);
         const systemPrefix = path.join(processedDir, 'system_transcript');
         console.log('Transcribing system track...');
         systemTranscript = await transcribe(systemWav, outputDir, (p) => {
@@ -306,9 +312,8 @@ async function transcribeSession(sessionDir, outputDir, progressCallback, option
       })()
     : Promise.resolve();
 
-  const micPromise = manifest.tracks.mic.status === 'complete'
+  const micPromise = micUsable
     ? (async () => {
-        const micWav = path.join(sessionDir, manifest.tracks.mic.file);
         const micPrefix = path.join(processedDir, 'mic_transcript');
         console.log('Transcribing mic track...');
         micTranscript = await transcribe(micWav, outputDir, (p) => {

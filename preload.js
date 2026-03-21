@@ -89,7 +89,7 @@ contextBridge.exposeInMainWorld('meetingRecorder', {
   },
 
   onProcessingComplete: (callback) => {
-    ipcRenderer.on('processing:complete', (event) => callback());
+    ipcRenderer.on('processing:complete', (event, data) => callback(data));
   },
 
   onError: (callback) => {

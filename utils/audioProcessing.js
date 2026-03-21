@@ -107,4 +107,52 @@ function trimSilence(inputFile, options = {}) {
   });
 }
 
-module.exports = { trimSilence };
+/**
+ * Repair a WAV file whose RIFF/data size headers are zero (e.g. from an
+ * unclean SCK shutdown).  Calculates the correct sizes from the actual
+ * file length and patches the header in-place.
+ *
+ * @param {string} wavPath - Absolute path to the WAV file
+ * @returns {boolean} true if the header was repaired, false if no repair was needed
+ */
+function repairWavHeader(wavPath) {
+  if (!fs.existsSync(wavPath)) return false;
+
+  const fd = fs.openSync(wavPath, 'r+');
+  try {
+    const header = Buffer.alloc(44);
+    const bytesRead = fs.readSync(fd, header, 0, 44, 0);
+    if (bytesRead < 44) return false;
+
+    // Verify this is a RIFF/WAVE file
+    if (header.toString('ascii', 0, 4) !== 'RIFF' || header.toString('ascii', 8, 12) !== 'WAVE') {
+      return false;
+    }
+
+    const riffSize = header.readUInt32LE(4);
+    const dataSize = header.readUInt32LE(40);
+
+    // Only repair if both size fields are zero (placeholder header)
+    if (riffSize !== 0 || dataSize !== 0) return false;
+
+    const fileSize = fs.fstatSync(fd).size;
+    const actualDataSize = fileSize - 44;
+    if (actualDataSize <= 0) return false;
+
+    // Patch RIFF chunk size (offset 4) = fileSize - 8
+    const buf4 = Buffer.alloc(4);
+    buf4.writeUInt32LE(fileSize - 8, 0);
+    fs.writeSync(fd, buf4, 0, 4, 4);
+
+    // Patch data chunk size (offset 40)
+    buf4.writeUInt32LE(actualDataSize, 0);
+    fs.writeSync(fd, buf4, 0, 4, 40);
+
+    console.log(`WAV header repaired: ${path.basename(wavPath)} (data size: ${(actualDataSize / (1024 * 1024)).toFixed(2)} MB)`);
+    return true;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+module.exports = { trimSilence, repairWavHeader };

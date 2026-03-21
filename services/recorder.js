@@ -2,6 +2,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { findBlackHoleDevice, checkSckAvailable } = require('../utils/audioDevices');
+const { repairWavHeader } = require('../utils/audioProcessing');
 
 /**
  * Determine the best system audio capture method available.
@@ -246,6 +247,9 @@ class Recorder {
           reject(new Error('Recording file was not created'));
           return;
         }
+
+        // Repair WAV header if SCK didn't finalise cleanly
+        repairWavHeader(this.currentFile);
 
         const stats = fs.statSync(this.currentFile);
 
@@ -676,6 +680,8 @@ class DualTrackRecorder {
 
           // Check system file
           if (fs.existsSync(this.systemFile)) {
+            // Repair WAV header if SCK didn't finalise cleanly
+            repairWavHeader(this.systemFile);
             const stats = fs.statSync(this.systemFile);
             systemSize = stats.size;
             this.manifest.tracks.system.size = systemSize;
@@ -686,6 +692,7 @@ class DualTrackRecorder {
 
           // Check mic file
           if (fs.existsSync(this.micFile)) {
+            repairWavHeader(this.micFile);
             const stats = fs.statSync(this.micFile);
             micSize = stats.size;
             this.manifest.tracks.mic.size = micSize;

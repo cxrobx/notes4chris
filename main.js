@@ -305,7 +305,7 @@ function initRecorder() {
  * Create menu bar tray icon
  */
 function createTray() {
-  const iconPath = path.join(__dirname, 'assets', 'icon.png');
+  const iconPath = path.join(__dirname, 'assets', 'trayIcon.png');
   trayIcon = nativeImage.createFromPath(iconPath).resize({
     height: process.platform === 'darwin' ? 18 : 18
   });
