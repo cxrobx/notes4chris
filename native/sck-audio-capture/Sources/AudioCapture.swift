@@ -78,8 +78,25 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
             throw CaptureError.noDisplayFound
         }
 
-        // Create content filter — capture entire display but we only want audio
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        // Two SCK filter shapes produce different internal audio paths on macOS 14.x.
+        // `display:excludingWindows:` uses the display's audio mix, which can be
+        // silently hijacked by other audio clients (Rogue Amoeba ARK/ACE, BlackHole
+        // aggregate, etc.) — SCK then delivers zero-filled frames with no error.
+        // `display:including:apps:exceptingWindows:` taps per-app audio directly
+        // and bypasses the hijack. Exclude our own pid so we don't self-capture.
+        let ownPid = ProcessInfo.processInfo.processIdentifier
+        let capturedApps = content.applications.filter { $0.processID != ownPid }
+
+        guard !capturedApps.isEmpty else {
+            throw CaptureError.streamStartFailed("No capturable applications found")
+        }
+
+        let filter = SCContentFilter(
+            display: display,
+            including: capturedApps,
+            exceptingWindows: []
+        )
+        fputs("DEBUG: Using including-apps filter, apps=\(capturedApps.count)\n", stderr)
 
         // Configure stream for audio-only capture
         let config = SCStreamConfiguration()
