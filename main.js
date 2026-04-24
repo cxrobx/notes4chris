@@ -482,7 +482,6 @@ function showPreRecordPopup() {
   preRecordWindow.once('ready-to-show', () => {
     preRecordWindow.show();
     preRecordWindow.focus();
-    app.dock.show();  // Ensure app appears in dock so it can take focus
   });
   preRecordWindow.on('closed', () => { preRecordWindow = null; });
 }

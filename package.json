@@ -45,6 +45,7 @@
       "hardenedRuntime": true,
       "entitlements": "entitlements.mac.plist",
       "extendInfo": {
+        "LSUIElement": true,
         "NSMicrophoneUsageDescription": "Notes4Chris needs microphone access to record your voice during meetings.",
         "NSScreenCaptureUsageDescription": "Notes4Chris needs Screen Recording permission to capture system audio during meetings."
       }
