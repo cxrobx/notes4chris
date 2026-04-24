@@ -1,4 +1,4 @@
-const { app, Tray, Menu, BrowserWindow, shell, nativeImage, Notification, dialog, ipcMain } = require('electron');
+const { app, Tray, Menu, BrowserWindow, screen, shell, nativeImage, Notification, dialog, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -29,6 +29,7 @@ const { ensureDirectoryStructure, cleanupOldRecordings, getStorageStats } = requ
 const { listInputDevices, findDefaultMicrophone, verifyInputDevice, findBlackHoleDevice, checkSckAvailable } = require('./utils/audioDevices');
 const { trimSilence } = require('./utils/audioProcessing');
 const { checkForProvider } = require('./services/companionTranscript');
+const { MeetingDetector } = require('./services/meetingDetector');
 
 const OBSIDIAN_VAULT_DIRECTORY = path.join(app.getPath('documents'), 'CX');
 
@@ -47,13 +48,18 @@ const store = new Store({
       participants: '',
       agenda: ''
     },
-    useSharedTranscript: true
+    useSharedTranscript: true,
+    meetingDetectionEnabled: true
   }
 });
 
 let tray = null;
 let settingsWindow = null;
 let preRecordWindow = null;
+let meetingBannerWindow = null;
+let meetingBannerTimer = null;
+let meetingDetector = null;
+let currentDetection = null; // { app, displayName, fingerprint } of the meeting currently shown
 let recorder = null;
 let dualRecorder = null;
 let currentRecordingPath = null;
@@ -487,6 +493,127 @@ function showPreRecordPopup() {
 }
 
 /**
+ * Show the meeting-detection banner near the top of the primary display.
+ * Auto-dismisses after 30s, or on user action.
+ */
+const MEETING_BANNER_WIDTH = 460;
+const MEETING_BANNER_HEIGHT = 84;
+const MEETING_BANNER_AUTO_HIDE_MS = 30000;
+
+function createMeetingBanner(detection) {
+  // If a banner is already up for a different meeting, replace it
+  if (meetingBannerWindow && !meetingBannerWindow.isDestroyed()) {
+    meetingBannerWindow.close();
+  }
+
+  currentDetection = detection;
+
+  const display = screen.getPrimaryDisplay();
+  const { x: workX, y: workY, width: workWidth } = display.workArea;
+  const x = Math.round(workX + (workWidth - MEETING_BANNER_WIDTH) / 2);
+  const y = workY + 8;
+
+  meetingBannerWindow = new BrowserWindow({
+    width: MEETING_BANNER_WIDTH,
+    height: MEETING_BANNER_HEIGHT,
+    x,
+    y,
+    frame: false,
+    transparent: true,
+    hasShadow: true,
+    alwaysOnTop: true,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    skipTaskbar: true,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload-meeting-banner.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true
+    }
+  });
+
+  meetingBannerWindow.loadFile(path.join(__dirname, 'renderer', 'meeting-banner.html'));
+  meetingBannerWindow.setAlwaysOnTop(true, 'floating');
+
+  meetingBannerWindow.once('ready-to-show', () => {
+    if (meetingBannerWindow && !meetingBannerWindow.isDestroyed()) {
+      meetingBannerWindow.show();
+    }
+  });
+
+  meetingBannerWindow.on('closed', () => {
+    meetingBannerWindow = null;
+    if (meetingBannerTimer) {
+      clearTimeout(meetingBannerTimer);
+      meetingBannerTimer = null;
+    }
+  });
+
+  // Auto-hide after 30s unless the user acts sooner
+  meetingBannerTimer = setTimeout(() => {
+    meetingBannerTimer = null;
+    if (meetingBannerWindow && !meetingBannerWindow.isDestroyed()) {
+      // Auto-dismissed: mark the fingerprint as seen so we don't re-prompt for the same meeting
+      if (currentDetection && meetingDetector) {
+        meetingDetector.markDismissed(currentDetection.fingerprint);
+      }
+      meetingBannerWindow.close();
+    }
+  }, MEETING_BANNER_AUTO_HIDE_MS);
+}
+
+function closeMeetingBanner(dismiss) {
+  if (meetingBannerTimer) {
+    clearTimeout(meetingBannerTimer);
+    meetingBannerTimer = null;
+  }
+  if (dismiss && currentDetection && meetingDetector) {
+    meetingDetector.markDismissed(currentDetection.fingerprint);
+  }
+  if (meetingBannerWindow && !meetingBannerWindow.isDestroyed()) {
+    meetingBannerWindow.close();
+  }
+}
+
+/**
+ * Is any recording currently active?
+ */
+function isRecordingActive() {
+  return (recorder && recorder.isRecording) || (dualRecorder && dualRecorder.isRecording);
+}
+
+/**
+ * Start the meeting detector if the user has it enabled and no recording is in progress.
+ * Called from app ready, after recording stops, and on settings toggle.
+ */
+function startMeetingDetectorIfEnabled() {
+  if (!store.get('meetingDetectionEnabled')) return;
+  if (isRecordingActive()) return;
+  if (!meetingDetector) return;
+  meetingDetector.start();
+}
+
+/**
+ * Initialize the meeting detector. Called once during app ready.
+ */
+function initMeetingDetector() {
+  meetingDetector = new MeetingDetector();
+  meetingDetector.onMeetingDetected((detection) => {
+    // Defensive: if a recording started between polls, don't show the banner
+    if (isRecordingActive()) return;
+    console.log(`Meeting detected: ${detection.displayName} (${detection.fingerprint})`);
+    createMeetingBanner(detection);
+  });
+
+  if (store.get('meetingDetectionEnabled')) {
+    meetingDetector.start();
+  }
+}
+
+/**
  * Actually start the recording after context is collected
  */
 function startRecordingWithContext(meetingContext) {
@@ -495,6 +622,10 @@ function startRecordingWithContext(meetingContext) {
 
   // Reinitialize recorder so it picks up the new context
   initRecorder();
+
+  // Suspend meeting detection — no polling, no banners during a recording
+  if (meetingDetector) meetingDetector.stop();
+  closeMeetingBanner(false);
 
   const mode = store.get('recordingMode');
   const useDual = mode === 'dual' && dualRecorder;
@@ -557,6 +688,9 @@ function startRecordingWithContext(meetingContext) {
   } catch (err) {
     console.error('Failed to start recording:', err);
 
+    // Recording failed — resume meeting detection since we're not actually recording
+    startMeetingDetectorIfEnabled();
+
     const errorMessage = err.message.split('\n')[0];
     showNotification('Cannot Start Recording', errorMessage, true);
 
@@ -590,6 +724,7 @@ async function handleStopRecording() {
 
   try {
     stopLevelMonitor();
+    startMeetingDetectorIfEnabled();
 
     // Clear interval and update menu immediately (isRecording is set to false
     // synchronously in both Recorder.stop() and DualTrackRecorder.stop())
@@ -876,6 +1011,7 @@ async function processSession(sessionDir, duration) {
 
     const obsidianPath = exportNotesToVault(notesPath, {
       title: buildSessionNoteTitle(updatedManifest),
+      participants: updatedManifest.meetingContext?.participants,
       startTime: updatedManifest.startTime,
       existingPath: updatedManifest.processing.obsidianExport
     });
@@ -1065,9 +1201,33 @@ ipcMain.handle('prerecord:cancel', async () => {
   return { success: true };
 });
 
+// Meeting detection banner
+ipcMain.handle('meeting:getContext', async () => {
+  return currentDetection || null;
+});
+
+ipcMain.handle('meeting:takeNotes', async () => {
+  // Mark dismissed so we don't re-fire for this meeting after the pre-record popup closes
+  if (currentDetection && meetingDetector) {
+    meetingDetector.markDismissed(currentDetection.fingerprint);
+  }
+  closeMeetingBanner(false);
+  showPreRecordPopup();
+  return { success: true };
+});
+
+ipcMain.handle('meeting:dismiss', async () => {
+  closeMeetingBanner(true);
+  return { success: true };
+});
+
 // Recording Controls
 ipcMain.handle('recording:start', async () => {
   try {
+    // Suspend meeting detection for the duration of the recording
+    if (meetingDetector) meetingDetector.stop();
+    closeMeetingBanner(false);
+
     const mode = store.get('recordingMode');
     const useDual = mode === 'dual' && dualRecorder;
 
@@ -1087,6 +1247,8 @@ ipcMain.handle('recording:start', async () => {
     }
   } catch (err) {
     console.error('IPC recording:start failed:', err);
+    // Recording didn't start — resume detection
+    startMeetingDetectorIfEnabled();
     return { success: false, error: err.message };
   }
 });
@@ -1094,6 +1256,7 @@ ipcMain.handle('recording:start', async () => {
 ipcMain.handle('recording:stop', async () => {
   try {
     stopLevelMonitor();
+    startMeetingDetectorIfEnabled();
     const mode = store.get('recordingMode');
     const useDual = mode === 'dual' && dualRecorder && dualRecorder.isRecording;
 
@@ -1535,6 +1698,7 @@ ipcMain.handle('process:full', async (event, wavPathOrSessionDir) => {
 
       const obsidianPath = exportNotesToVault(notesPath, {
         title: buildSessionNoteTitle(updatedManifest),
+        participants: updatedManifest.meetingContext?.participants,
         startTime: updatedManifest.startTime,
         existingPath: updatedManifest.processing.obsidianExport
       });
@@ -1584,7 +1748,8 @@ ipcMain.handle('settings:get', async () => {
     micDevice: store.get('micDevice'),
     systemLabel: store.get('systemLabel'),
     micLabel: store.get('micLabel'),
-    meetingContext: store.get('meetingContext')
+    meetingContext: store.get('meetingContext'),
+    meetingDetectionEnabled: store.get('meetingDetectionEnabled')
   };
 });
 
@@ -1613,6 +1778,18 @@ ipcMain.handle('settings:update', async (event, settings) => {
     }
     if (settings.meetingContext !== undefined) {
       store.set('meetingContext', settings.meetingContext);
+    }
+    if (settings.meetingDetectionEnabled !== undefined) {
+      store.set('meetingDetectionEnabled', settings.meetingDetectionEnabled);
+      // Apply immediately: start or stop the detector based on the new value
+      if (meetingDetector) {
+        if (settings.meetingDetectionEnabled) {
+          startMeetingDetectorIfEnabled();
+        } else {
+          meetingDetector.stop();
+          closeMeetingBanner(false);
+        }
+      }
     }
 
     // Reinitialize recorder with new settings
@@ -1757,6 +1934,9 @@ app.whenReady().then(() => {
   // Run cleanup on startup
   runCleanup();
 
+  // Start the meeting detector (will no-op if the user has disabled it)
+  initMeetingDetector();
+
   console.log('Notes4Chris ready. Click the menu bar icon to start recording.');
 
   // Show welcome message if dependencies are missing
@@ -1796,6 +1976,10 @@ app.on('window-all-closed', (e) => {
  */
 app.on('before-quit', () => {
   console.log('App quitting, cleaning up...');
+
+  // Stop the meeting detector
+  if (meetingDetector) meetingDetector.stop();
+  closeMeetingBanner(false);
 
   // Stop level monitor
   stopLevelMonitor();

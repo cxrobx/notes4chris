@@ -62,6 +62,8 @@ async function loadSettings() {
     document.getElementById('output-directory').value = currentSettings.outputDirectory;
     document.getElementById('retention-days').value = currentSettings.retentionDays;
     document.getElementById('auto-process').checked = currentSettings.autoProcess;
+    document.getElementById('meeting-detection-enabled').checked =
+      currentSettings.meetingDetectionEnabled !== false;
 
     updateRetentionLabel(currentSettings.retentionDays);
 
@@ -597,6 +599,7 @@ async function handleSaveSettings() {
       outputDirectory: document.getElementById('output-directory').value,
       retentionDays: parseInt(document.getElementById('retention-days').value),
       autoProcess: document.getElementById('auto-process').checked,
+      meetingDetectionEnabled: document.getElementById('meeting-detection-enabled').checked,
       recordingMode: activeMode,
       micDevice: micDevice,
       systemLabel: document.getElementById('system-label').value || 'Remote',

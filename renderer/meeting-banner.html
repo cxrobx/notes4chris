@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';">
+  <title>Meeting detected</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: transparent;
+      font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
+      -webkit-user-select: none;
+      user-select: none;
+      overflow: hidden;
+    }
+
+    .banner {
+      position: relative;
+      margin: 6px;
+      height: calc(100% - 12px);
+      background: #1c1c1e;
+      border-radius: 18px;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      padding: 0 16px 0 56px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+      -webkit-app-region: drag;
+    }
+
+    .accent {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 4px;
+      background: linear-gradient(90deg, #1e5bff 0%, #3f7dff 100%);
+    }
+
+    .close {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.08);
+      border: none;
+      color: rgba(255, 255, 255, 0.7);
+      cursor: pointer;
+      font-size: 12px;
+      line-height: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.15s;
+      -webkit-app-region: no-drag;
+    }
+    .close:hover { background: rgba(255, 255, 255, 0.15); }
+
+    .icon {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      background: #2e7cff;
+      margin-right: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      font-weight: 700;
+      color: white;
+      flex-shrink: 0;
+    }
+    .icon[data-app="zoom"] { background: #2d8cff; }
+    .icon[data-app="facetime"] { background: #30d158; }
+    .icon[data-app="meet"] { background: #ffffff; color: #1e8e3e; }
+
+    .text {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .title {
+      font-size: 13px;
+      font-weight: 600;
+      color: rgba(255, 255, 255, 0.95);
+      letter-spacing: -0.1px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .subtitle {
+      font-size: 11px;
+      color: rgba(255, 255, 255, 0.55);
+      margin-top: 1px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 1px;
+      flex-shrink: 0;
+      margin-left: 12px;
+    }
+
+    .take-notes {
+      background: white;
+      color: black;
+      border: none;
+      padding: 7px 16px;
+      border-radius: 16px 0 0 16px;
+      font-size: 13px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      transition: opacity 0.15s;
+      -webkit-app-region: no-drag;
+    }
+    .take-notes:hover { opacity: 0.85; }
+    .take-notes:active { opacity: 0.7; }
+
+    .chevron {
+      background: white;
+      color: black;
+      border: none;
+      padding: 7px 10px;
+      border-radius: 0 16px 16px 0;
+      font-size: 10px;
+      font-family: inherit;
+      cursor: default;
+      opacity: 0.6;
+      -webkit-app-region: no-drag;
+    }
+  </style>
+</head>
+<body>
+  <div class="banner">
+    <div class="accent"></div>
+    <button class="close" id="btn-close" title="Dismiss">✕</button>
+    <div class="icon" id="app-icon" data-app="">📹</div>
+    <div class="text">
+      <div class="title">Note-taking is available</div>
+      <div class="subtitle" id="app-name">Meeting</div>
+    </div>
+    <div class="actions">
+      <button class="take-notes" id="btn-take-notes">Take notes</button>
+      <button class="chevron">▾</button>
+    </div>
+  </div>
+
+  <script>
+    const iconGlyphs = {
+      zoom: 'Z',
+      facetime: '📞',
+      meet: 'M'
+    };
+
+    (async () => {
+      try {
+        const ctx = await window.meetingBanner.getContext();
+        if (ctx) {
+          const appIcon = document.getElementById('app-icon');
+          const appName = document.getElementById('app-name');
+          appIcon.dataset.app = ctx.app || '';
+          appIcon.textContent = iconGlyphs[ctx.app] || '📹';
+          appName.textContent = ctx.displayName || 'Meeting';
+        }
+      } catch (err) {
+        // Leave defaults
+      }
+    })();
+
+    document.getElementById('btn-close').addEventListener('click', () => {
+      window.meetingBanner.dismiss();
+    });
+
+    document.getElementById('btn-take-notes').addEventListener('click', () => {
+      window.meetingBanner.takeNotes();
+    });
+  </script>
+</body>
+</html>
