@@ -332,9 +332,10 @@ function resolveObsidianExportPath(vaultDir, notesPath, options) {
  */
 function buildObsidianFilename(notesPath, options) {
   const title = normaliseExportTitle(options.title || path.basename(notesPath, '.md')) || 'Meeting summary';
+  const people = normaliseExportTitle(options.participants);
   const timestamp = formatTimestampForFilename(options.startTime);
-  const stem = timestamp ? `${title} ${timestamp}` : title;
-  return `${truncateFilename(stem)}.md`;
+  const parts = [title, people, timestamp].filter(Boolean);
+  return `${truncateFilename(parts.join(' '))}.md`;
 }
 
 /**
