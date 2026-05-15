@@ -113,6 +113,28 @@ else
 fi
 echo ""
 
+# Build calendar-helper Swift binary
+echo "🔨 Building calendar-helper (EventKit CLI)..."
+if [ -d "native/calendar-helper" ]; then
+  if command -v swift &> /dev/null; then
+    (cd native/calendar-helper && swift build -c release \
+        -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+        -Xlinker "$PWD/Info.plist" \
+      && codesign -f -s - --entitlements CalendarHelper.entitlements \
+        --identifier com.christopherrobinson.calendar-helper .build/release/calendar-helper)
+    if [ -f "native/calendar-helper/.build/release/calendar-helper" ]; then
+      echo "✅ calendar-helper built and signed"
+    else
+      echo "⚠️  calendar-helper build did not produce a binary"
+    fi
+  else
+    echo "⚠️  swift not available — install Xcode Command Line Tools to build calendar-helper"
+  fi
+else
+  echo "⚠️  native/calendar-helper/ not found"
+fi
+echo ""
+
 echo "================================"
 echo "✅ Setup complete!"
 echo ""

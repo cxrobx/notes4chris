@@ -1,6 +1,6 @@
 # Known Gotchas
 
-Organised by category. 6 items, condensed format. Original numbering preserved (gaps intentional).
+Organised by category. 7 items, condensed format. Original numbering preserved (gaps intentional).
 
 ## Index
 
@@ -12,6 +12,7 @@ Organised by category. 6 items, condensed format. Original numbering preserved (
 | 4 | Orphaned sox processes on crash | Backend |
 | 5 | SCK delivers zero-filled frames with ARK.driver loaded | Environment |
 | 6 | "Both tracks silent" — compound failure diagnostic | Backend |
+| 7 | EventKit permission prompt timing + per-binary-signature trigger | Environment |
 
 ---
 
@@ -68,6 +69,15 @@ Organised by category. 6 items, condensed format. Original numbering preserved (
 3. `sox recordings/<latest>/system.wav -n stat 2>&1 | grep -E 'amplitude|RMS'` and same for `mic.wav` → zeros vs non-zeros tells you which track(s) are actually silent.
 4. **Cross-check with a known-good app**: does QuickTime capture mic audio right now? If yes, any mic failure in notes4chris is app-specific (usually #4). If no, the problem is OS-level and nothing in this codebase will fix it.
 **Solution**: Treat the two failures independently. Never assume "both broken" = "one bug." Never propose architectural rewrites until the diagnostic ritual above is complete.
+
+### 7. EventKit Permission Prompt — Triggered by the Helper, Per-Binary-Signature
+**Symptom**: First-run users see no Calendar prompt despite enabling calendar suggestions in Settings. Or: re-signed dev builds re-prompt for permission even though the production build was already granted.
+**Cause**: The macOS Calendar permission prompt fires the first time `EKEventStore` is opened by a process that has `NSCalendarsUsageDescription` (and on macOS 14+ `NSCalendarsFullAccessUsageDescription`) in its bundle Info.plist. In Notes4Chris this is the `calendar-helper` Swift CLI, NOT the Electron app — the Electron process never touches EventKit directly. macOS keys the granted/denied decision by the binary's code signature, so re-signing with a different identity (e.g. switching dev provisioning) re-prompts the user.
+**Diagnostic**:
+- `tccutil` is the wrong tool here; check via Settings → Privacy & Security → Calendars and look for `calendar-helper` as a distinct entry alongside Notes4Chris.
+- `codesign -dv native/calendar-helper/.build/release/calendar-helper 2>&1 | grep TeamIdentifier` — if this changes between builds, expect re-prompts.
+**Solution**: Always sign the helper with the same identity used for the parent app (`-`/ad-hoc for local builds, the same Developer ID for distribution). The helper's own `Info.plist` must carry both the legacy and full-access usage strings; missing the macOS-14 string causes the prompt to silently never fire on macOS 14+.
+**Pattern**: `native/calendar-helper/Info.plist`, `native/calendar-helper/CalendarHelper.entitlements`, `package.json` `scripts.build:calendar`, `setup.sh` calendar-helper build step.
 
 ## Lifecycle Management
 

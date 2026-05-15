@@ -12,6 +12,18 @@
  * Hysteresis: an app is only considered "meeting ended" after MISS_THRESHOLD
  * consecutive polls with no signal. This prevents single transient failures
  * from re-triggering the banner mid-meeting.
+ *
+ * Calendar enrichment (optional): the constructor accepts an async `enricher`
+ * that returns the currently in-progress calendar event (or null). When a
+ * meeting is detected, the canonical fingerprint becomes the calendar
+ * `occurrenceFingerprint` if the enricher returns a match — which means a
+ * user-dismissed pre-meeting banner ALSO suppresses the detector banner for
+ * the same occurrence. App-only detections keep the old `<app>-<timestamp>`
+ * fingerprint shape.
+ *
+ * Dismissal state lives in the injected `dismissalRegistry`, not on the
+ * detector. There is no `markDismissed` here — callers should go through the
+ * registry directly.
  */
 
 const { exec } = require('child_process');
@@ -21,16 +33,24 @@ const execAsync = promisify(exec);
 
 const POLL_INTERVAL_MS = 10000;
 const MISS_THRESHOLD = 3;
+const ENRICHER_TIMEOUT_MS = 500;
 
 class MeetingDetector {
-  constructor() {
+  /**
+   * @param {object} [opts]
+   * @param {object} [opts.dismissalRegistry] - shared registry; required for dedup
+   * @param {() => Promise<object|null>} [opts.enricher] - async lookup for the current calendar event
+   */
+  constructor({ dismissalRegistry = null, enricher = null } = {}) {
+    this._registry = dismissalRegistry;
+    this._enricher = enricher;
+
     this._interval = null;
     this._running = false;
     this._callback = null;
 
     // app -> { firstDetectedAt, consecutiveMisses, fingerprint, displayName }
     this._activeApps = new Map();
-    this._dismissedFingerprints = new Set();
   }
 
   start() {
@@ -58,11 +78,34 @@ class MeetingDetector {
   }
 
   /**
-   * Called by main.js when the user clicks X on a banner. Marks the fingerprint
-   * as dismissed so we don't re-fire for the same meeting session.
+   * Run the enricher with a bounded timeout. Returns null on miss, timeout,
+   * or error — the detector falls back to the un-enriched banner in any of
+   * those cases.
    */
-  markDismissed(fingerprint) {
-    this._dismissedFingerprints.add(fingerprint);
+  async _tryEnrich() {
+    if (typeof this._enricher !== 'function') return null;
+
+    let timer;
+    const timeoutPromise = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), ENRICHER_TIMEOUT_MS);
+    });
+
+    try {
+      const result = await Promise.race([
+        Promise.resolve().then(() => this._enricher()),
+        timeoutPromise
+      ]);
+      return result || null;
+    } catch (_err) {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  _isDismissed(fingerprint) {
+    if (!this._registry || !fingerprint) return false;
+    return this._registry.isDismissed(fingerprint);
   }
 
   async _poll() {
@@ -93,27 +136,42 @@ class MeetingDetector {
       const existing = this._activeApps.get(app);
       if (existing) {
         existing.consecutiveMisses = 0;
-      } else {
-        const firstDetectedAt = Date.now();
-        const fingerprint = `${app}-${firstDetectedAt}`;
-        this._activeApps.set(app, {
-          firstDetectedAt,
-          consecutiveMisses: 0,
-          fingerprint,
-          displayName: currentDetections[app].displayName
-        });
+        continue;
+      }
 
-        if (!this._dismissedFingerprints.has(fingerprint) && this._callback) {
-          try {
-            this._callback({
-              app,
-              displayName: currentDetections[app].displayName,
-              fingerprint
-            });
-          } catch (err) {
-            // Callback errors must not kill the detector loop
-          }
-        }
+      const firstDetectedAt = Date.now();
+      const appFingerprint = `${app}-${firstDetectedAt}`;
+
+      // Try to enrich with the current calendar event. If we hit, the calendar
+      // fingerprint becomes the canonical id used everywhere — including the
+      // dismissal check — so dismissing the pre-meeting banner also suppresses
+      // this detector firing for the same occurrence.
+      const calendarEvent = await this._tryEnrich();
+      const fingerprint = calendarEvent && typeof calendarEvent.occurrenceFingerprint === 'string'
+        ? calendarEvent.occurrenceFingerprint
+        : appFingerprint;
+
+      this._activeApps.set(app, {
+        firstDetectedAt,
+        consecutiveMisses: 0,
+        fingerprint,
+        appFingerprint,
+        displayName: currentDetections[app].displayName
+      });
+
+      if (this._isDismissed(fingerprint)) continue;
+      if (!this._callback) continue;
+
+      try {
+        this._callback({
+          app,
+          displayName: currentDetections[app].displayName,
+          fingerprint,
+          appFingerprint,
+          calendarEvent
+        });
+      } catch (_err) {
+        // Callback errors must not kill the detector loop
       }
     }
 
@@ -124,7 +182,6 @@ class MeetingDetector {
       if (!currentDetections[app]) {
         state.consecutiveMisses++;
         if (state.consecutiveMisses >= MISS_THRESHOLD) {
-          this._dismissedFingerprints.delete(state.fingerprint);
           this._activeApps.delete(app);
         }
       }

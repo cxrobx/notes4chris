@@ -6,7 +6,9 @@
   "scripts": {
     "start": "electron .",
     "build:sck": "cd native/sck-audio-capture && swift build -c release && codesign -f -s - --identifier com.christopherrobinson.sck-audio-capture .build/release/sck-audio-capture",
-    "prebuild": "npm run build:sck",
+    "build:calendar": "cd native/calendar-helper && swift build -c release -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker \"$PWD/Info.plist\" && codesign -f -s - --entitlements CalendarHelper.entitlements --identifier com.christopherrobinson.calendar-helper .build/release/calendar-helper",
+    "build:native": "npm run build:sck && npm run build:calendar",
+    "prebuild": "npm run build:native",
     "build": "electron-builder",
     "postinstall": "electron-builder install-app-deps",
     "summaryonly": "node summarise-only.js"
@@ -47,13 +49,19 @@
       "extendInfo": {
         "LSUIElement": true,
         "NSMicrophoneUsageDescription": "Notes4Chris needs microphone access to record your voice during meetings.",
-        "NSScreenCaptureUsageDescription": "Notes4Chris needs Screen Recording permission to capture system audio during meetings."
+        "NSScreenCaptureUsageDescription": "Notes4Chris needs Screen Recording permission to capture system audio during meetings.",
+        "NSCalendarsUsageDescription": "Notes4Chris reads your calendar to suggest note-taking before meetings start and enrich the in-meeting banner with title, attendees, and agenda.",
+        "NSCalendarsFullAccessUsageDescription": "Notes4Chris reads your calendar to suggest note-taking before meetings start and enrich the in-meeting banner with title, attendees, and agenda."
       }
     },
     "extraResources": [
       {
         "from": "native/sck-audio-capture/.build/release/sck-audio-capture",
         "to": "sck-audio-capture"
+      },
+      {
+        "from": "native/calendar-helper/.build/release/calendar-helper",
+        "to": "calendar-helper"
       }
     ],
     "files": [

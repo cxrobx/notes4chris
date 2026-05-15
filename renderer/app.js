@@ -65,6 +65,24 @@ async function loadSettings() {
     document.getElementById('meeting-detection-enabled').checked =
       currentSettings.meetingDetectionEnabled !== false;
 
+    // Calendar suggestion fields
+    const calToggle = document.getElementById('calendar-suggestions-enabled');
+    if (calToggle) calToggle.checked = currentSettings.calendarSuggestionsEnabled === true;
+
+    const leadInput = document.getElementById('calendar-lead-time');
+    if (leadInput) {
+      const lead = Number(currentSettings.calendarLeadTimeMinutes);
+      leadInput.value = Number.isFinite(lead) ? lead : 2;
+    }
+
+    const denylistTextarea = document.getElementById('calendar-denylist');
+    if (denylistTextarea) {
+      const list = Array.isArray(currentSettings.calendarDenylist) ? currentSettings.calendarDenylist : [];
+      denylistTextarea.value = list.join('\n');
+    }
+
+    await loadCalendarPermission();
+
     updateRetentionLabel(currentSettings.retentionDays);
 
     // Update recording mode toggle
@@ -89,6 +107,49 @@ async function loadSettings() {
     console.error('Failed to load settings:', err);
     showError('Failed to load settings');
   }
+}
+
+async function loadCalendarPermission() {
+  const statusEl = document.getElementById('calendar-permission-status');
+  const requestBtn = document.getElementById('btn-calendar-request');
+  const privacyBtn = document.getElementById('btn-calendar-privacy');
+  if (!statusEl || !requestBtn || !privacyBtn) return;
+
+  try {
+    const state = await api.getCalendarPermissionState();
+    applyCalendarPermissionState(state);
+  } catch (err) {
+    console.error('Failed to read calendar permission state:', err);
+  }
+}
+
+function applyCalendarPermissionState(state) {
+  const statusEl = document.getElementById('calendar-permission-status');
+  const requestBtn = document.getElementById('btn-calendar-request');
+  const privacyBtn = document.getElementById('btn-calendar-privacy');
+  if (!statusEl || !requestBtn || !privacyBtn) return;
+
+  let label = 'Status: not determined';
+  let showRequest = true;
+  let showPrivacy = false;
+
+  if (state === 'granted') {
+    label = 'Status: granted';
+    showRequest = false;
+    showPrivacy = false;
+  } else if (state === 'denied') {
+    label = 'Status: denied — open System Settings to grant access';
+    showRequest = false;
+    showPrivacy = true;
+  } else {
+    label = 'Status: not determined — click to request access';
+    showRequest = true;
+    showPrivacy = false;
+  }
+
+  statusEl.textContent = label;
+  requestBtn.style.display = showRequest ? '' : 'none';
+  privacyBtn.style.display = showPrivacy ? '' : 'none';
 }
 
 async function loadDependencies() {
@@ -401,6 +462,32 @@ function setupEventListeners() {
 
   // Preflight check
   document.getElementById('btn-preflight').addEventListener('click', runPreflightCheck);
+
+  // Calendar permission buttons
+  const reqBtn = document.getElementById('btn-calendar-request');
+  if (reqBtn) {
+    reqBtn.addEventListener('click', async () => {
+      try {
+        const result = await api.requestCalendarPermission();
+        const state = (result && result.state) || 'not-determined';
+        applyCalendarPermissionState(state);
+        if (state === 'granted') {
+          showSuccess('Calendar access granted');
+        } else if (state === 'denied') {
+          showInfo('Calendar access denied — you can re-enable it in System Settings');
+        }
+      } catch (err) {
+        console.error('Failed to request calendar permission:', err);
+        showError('Failed to request calendar permission');
+      }
+    });
+  }
+  const privacyBtn = document.getElementById('btn-calendar-privacy');
+  if (privacyBtn) {
+    privacyBtn.addEventListener('click', async () => {
+      try { await api.openCalendarPrivacySettings(); } catch (err) { console.error(err); }
+    });
+  }
 }
 
 let recordingTimerInterval = null;
@@ -595,6 +682,16 @@ async function handleSaveSettings() {
     const activeMode = document.getElementById('mode-dual').classList.contains('active') ? 'dual' : 'system';
     const micDevice = document.getElementById('mic-device').value || null;
 
+    // Calendar settings — collect (best-effort; UI elements always present in v1)
+    const calToggle = document.getElementById('calendar-suggestions-enabled');
+    const calLead = document.getElementById('calendar-lead-time');
+    const calDenylist = document.getElementById('calendar-denylist');
+    const calendarSuggestionsEnabled = calToggle ? calToggle.checked : false;
+    const calendarLeadTimeMinutes = calLead ? Math.max(0, Math.min(15, parseInt(calLead.value, 10) || 0)) : 2;
+    const calendarDenylist = calDenylist
+      ? calDenylist.value.split('\n').map(s => s.trim()).filter(Boolean)
+      : [];
+
     const newSettings = {
       outputDirectory: document.getElementById('output-directory').value,
       retentionDays: parseInt(document.getElementById('retention-days').value),
@@ -603,7 +700,10 @@ async function handleSaveSettings() {
       recordingMode: activeMode,
       micDevice: micDevice,
       systemLabel: document.getElementById('system-label').value || 'Remote',
-      micLabel: document.getElementById('mic-label').value || 'Me'
+      micLabel: document.getElementById('mic-label').value || 'Me',
+      calendarSuggestionsEnabled,
+      calendarLeadTimeMinutes,
+      calendarDenylist
     };
 
     const result = await api.updateSettings(newSettings);

@@ -9,6 +9,7 @@
 | Virtual Audio | BlackHole 2ch | system |
 | Transcription | whisper.cpp | local build |
 | Summarisation | Ollama (llama3.2) | system |
+| Calendar Source | EventKit (Swift CLI helper) | macOS 13+ |
 | Config Store | electron-store | 8.x |
 | Build Tool | electron-builder | 24.x |
 
@@ -29,11 +30,21 @@ notes4chris/
 │   ├── transcriber.js         # whisper.cpp wrapper + transcribeSession()
 │   ├── transcriptMerger.js    # CSV parser + merge algorithm
 │   ├── summariser.js          # Ollama wrapper + generateSessionNotes()
-│   └── fileManager.js         # Directory structure, cleanup, stats
+│   ├── fileManager.js         # Directory structure, cleanup, stats
+│   ├── meetingDetector.js     # App-based meeting detection (Zoom/FaceTime/Meet)
+│   ├── calendarSuggester.js   # 60s poll, filter rules, fire pre-meeting banners
+│   ├── dismissalRegistry.js   # Shared dismiss-state owner (consulted by both)
+│   └── calendarSources/       # Pluggable calendar source layer
+│       ├── index.js
+│       ├── macOSCalendarSource.js  # Spawns calendar-helper Swift CLI
+│       └── gmailCalendarSource.js  # v2 stub
 ├── utils/
 │   └── audioDevices.js        # BlackHole detection + mic enumeration
 ├── models/                    # whisper.cpp model files (ggml-base.en.bin)
 ├── assets/                    # App icons
+├── native/
+│   ├── sck-audio-capture/     # ScreenCaptureKit system audio CLI
+│   └── calendar-helper/       # EventKit calendar CLI (request-access/upcoming/current)
 └── whisper.cpp/               # Local whisper.cpp build (git submodule/clone)
 ```
 
@@ -62,6 +73,14 @@ Qualification: A rule belongs here if (1) violating it breaks the system in non-
 
 6. **Config store defaults**: `electron-store` defaults are defined in `main.js`. Default recording mode is `'dual'`, default labels are `'Remote'`/`'Me'`.
    - Why: Changing defaults affects all new users and existing users without saved preferences
+
+7. **Calendar permission gating**: The macOS Calendar permission prompt fires on first `EKEventStore` access from the `calendar-helper` Swift binary — not on app launch, not from Electron. The suggester must (a) request access on first start, (b) self-disable if denied, (c) not loop helper invocations against a denied state.
+   - Why: Without the user-facing permission flow, the helper exits with code 2/3 every poll and the UI never reflects the actual state.
+   - Pattern: `services/calendarSources/macOSCalendarSource.js` → `ensurePermission()`; `main.js` IPC `calendar:requestPermission`.
+
+8. **Single dismiss-state source**: Banner dismissals MUST go through `DismissalRegistry`. The meeting detector and calendar suggester both consult the same registry so dismissing the pre-meeting banner suppresses the in-meeting banner for the same occurrence (and vice versa).
+   - Why: Two independent dismissal sets would re-fire the banner the moment Zoom opens, defeating the whole point.
+   - Pattern: `services/dismissalRegistry.js` → `isDismissed()` / `dismiss({ kind, expiry })`.
 
 ## Key Patterns
 

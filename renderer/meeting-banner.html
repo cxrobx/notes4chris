@@ -147,7 +147,7 @@
     <button class="close" id="btn-close" title="Dismiss">✕</button>
     <div class="icon" id="app-icon" data-app="">📹</div>
     <div class="text">
-      <div class="title">Note-taking is available</div>
+      <div class="title" id="banner-title">Note-taking is available</div>
       <div class="subtitle" id="app-name">Meeting</div>
     </div>
     <div class="actions">
@@ -160,8 +160,21 @@
     const iconGlyphs = {
       zoom: 'Z',
       facetime: '📞',
-      meet: 'M'
+      meet: 'M',
+      calendar: '📅'
     };
+
+    function truncate(s, n) {
+      if (!s) return '';
+      return s.length > n ? s.slice(0, n - 1) + '…' : s;
+    }
+
+    function buildCalendarSubtitle(ev) {
+      const title = ev.title || 'Meeting';
+      const attendeeCount = Array.isArray(ev.attendees) ? ev.attendees.length : 0;
+      const suffix = attendeeCount ? ` • ${attendeeCount} attendees` : '';
+      return truncate(title + suffix, 80);
+    }
 
     (async () => {
       try {
@@ -169,9 +182,18 @@
         if (ctx) {
           const appIcon = document.getElementById('app-icon');
           const appName = document.getElementById('app-name');
+          const bannerTitle = document.getElementById('banner-title');
           appIcon.dataset.app = ctx.app || '';
           appIcon.textContent = iconGlyphs[ctx.app] || '📹';
-          appName.textContent = ctx.displayName || 'Meeting';
+
+          if (ctx.calendarEvent) {
+            // Enriched: show calendar title + attendee count as the subtitle,
+            // and override the headline so the user sees the actual meeting.
+            bannerTitle.textContent = 'Take notes for this meeting';
+            appName.textContent = buildCalendarSubtitle(ctx.calendarEvent);
+          } else {
+            appName.textContent = ctx.displayName || 'Meeting';
+          }
         }
       } catch (err) {
         // Leave defaults

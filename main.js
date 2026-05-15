@@ -30,6 +30,10 @@ const { listInputDevices, findDefaultMicrophone, verifyInputDevice, findBlackHol
 const { trimSilence } = require('./utils/audioProcessing');
 const { checkForProvider } = require('./services/companionTranscript');
 const { MeetingDetector } = require('./services/meetingDetector');
+const { DismissalRegistry } = require('./services/dismissalRegistry');
+const { CalendarSuggester } = require('./services/calendarSuggester');
+const { MacOSCalendarSource } = require('./services/calendarSources');
+const { spawn: childSpawn } = require('child_process');
 
 const OBSIDIAN_VAULT_DIRECTORY = path.join(app.getPath('documents'), 'CX');
 
@@ -49,7 +53,11 @@ const store = new Store({
       agenda: ''
     },
     useSharedTranscript: true,
-    meetingDetectionEnabled: true
+    meetingDetectionEnabled: true,
+    calendarSuggestionsEnabled: false,
+    calendarLeadTimeMinutes: 2,
+    calendarDenylist: ['Lunch', 'Gym', 'Focus', 'Block', 'OOO', 'Holiday'],
+    calendarDismissedFingerprints: []
   }
 });
 
@@ -59,7 +67,10 @@ let preRecordWindow = null;
 let meetingBannerWindow = null;
 let meetingBannerTimer = null;
 let meetingDetector = null;
-let currentDetection = null; // { app, displayName, fingerprint } of the meeting currently shown
+let calendarSuggester = null;
+let dismissalRegistry = null;
+let currentDetection = null; // { app, displayName, fingerprint, calendarEvent? }
+let pendingPreRecordContext = null; // seeded from currentDetection.calendarEvent when "Take notes" is clicked
 let recorder = null;
 let dualRecorder = null;
 let currentRecordingPath = null;
@@ -127,6 +138,69 @@ function getSckBinaryPath() {
     return path.join(process.resourcesPath, 'sck-audio-capture');
   }
   return path.join(__dirname, 'native', 'sck-audio-capture', '.build', 'release', 'sck-audio-capture');
+}
+
+/**
+ * Resolve path to the calendar-helper binary
+ */
+function getCalendarHelperPath() {
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, 'calendar-helper');
+  }
+  return path.join(__dirname, 'native', 'calendar-helper', '.build', 'release', 'calendar-helper');
+}
+
+/**
+ * Strip URLs and common meeting-join boilerplate from event notes so the
+ * pre-record popup's agenda field doesn't fill with Zoom/Meet/Teams junk.
+ * Cheap regex pass — not a full HTML parse.
+ */
+function buildAgendaFromNotes(notes) {
+  if (typeof notes !== 'string' || !notes) return '';
+  const cleaned = notes
+    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/^.*(zoom\.us|meet\.google\.com|teams\.microsoft\.com|teams\.live\.com)\S*.*$/gim, '')
+    .replace(/^.*Join Zoom Meeting.*$/gim, '')
+    .replace(/^.*Meeting ID:.*$/gim, '')
+    .replace(/^.*Passcode:.*$/gim, '')
+    .replace(/^.*Join Microsoft Teams.*$/gim, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return cleaned.slice(0, 500);
+}
+
+/**
+ * Convert an attendee record into a display name, falling back to the
+ * local-part of the email when no name is set (Google Calendar often
+ * returns only emails). Returns null when neither is usable.
+ */
+function attendeeDisplayName(attendee) {
+  if (!attendee) return null;
+  if (typeof attendee.name === 'string' && attendee.name.trim()) return attendee.name.trim();
+  if (typeof attendee.email === 'string' && attendee.email.includes('@')) {
+    return attendee.email.split('@')[0];
+  }
+  return null;
+}
+
+/**
+ * Map a calendar event into the pre-record popup's seed shape.
+ *   title         — event.title
+ *   participants  — other attendees (current user excluded), joined as "Alice, Bob"
+ *   agenda        — first 500 chars of event.notes, URLs/boilerplate stripped
+ */
+function buildPreRecordSeedFromEvent(event) {
+  if (!event) return null;
+  const attendees = Array.isArray(event.attendees) ? event.attendees : [];
+  const others = attendees
+    .filter(a => !a.isCurrentUser)
+    .map(attendeeDisplayName)
+    .filter(Boolean);
+  return {
+    title: typeof event.title === 'string' ? event.title : '',
+    participants: others.join(', '),
+    agenda: buildAgendaFromNotes(event.notes)
+  };
 }
 
 /**
@@ -557,12 +631,21 @@ function createMeetingBanner(detection) {
     meetingBannerTimer = null;
     if (meetingBannerWindow && !meetingBannerWindow.isDestroyed()) {
       // Auto-dismissed: mark the fingerprint as seen so we don't re-prompt for the same meeting
-      if (currentDetection && meetingDetector) {
-        meetingDetector.markDismissed(currentDetection.fingerprint);
-      }
+      recordDismissal(currentDetection);
       meetingBannerWindow.close();
     }
   }, MEETING_BANNER_AUTO_HIDE_MS);
+}
+
+function recordDismissal(detection) {
+  if (!detection || !dismissalRegistry) return;
+  const fp = detection.fingerprint;
+  if (!fp) return;
+  if (detection.calendarEvent && detection.calendarEvent.endTime) {
+    dismissalRegistry.dismiss(fp, { kind: 'calendar', expiry: detection.calendarEvent.endTime });
+  } else {
+    dismissalRegistry.dismiss(fp, { kind: 'app' });
+  }
 }
 
 function closeMeetingBanner(dismiss) {
@@ -570,8 +653,8 @@ function closeMeetingBanner(dismiss) {
     clearTimeout(meetingBannerTimer);
     meetingBannerTimer = null;
   }
-  if (dismiss && currentDetection && meetingDetector) {
-    meetingDetector.markDismissed(currentDetection.fingerprint);
+  if (dismiss) {
+    recordDismissal(currentDetection);
   }
   if (meetingBannerWindow && !meetingBannerWindow.isDestroyed()) {
     meetingBannerWindow.close();
@@ -597,10 +680,60 @@ function startMeetingDetectorIfEnabled() {
 }
 
 /**
- * Initialize the meeting detector. Called once during app ready.
+ * Start the calendar suggester if the user has it enabled and no recording
+ * is in progress. Mirrors startMeetingDetectorIfEnabled().
  */
-function initMeetingDetector() {
-  meetingDetector = new MeetingDetector();
+function startCalendarSuggesterIfEnabled() {
+  if (!store.get('calendarSuggestionsEnabled')) return;
+  if (isRecordingActive()) return;
+  if (!calendarSuggester) return;
+  calendarSuggester.start();
+}
+
+/**
+ * Initialize the meeting detector and calendar suggester. Called once during
+ * app ready. The detector gets an enricher callback that reads the
+ * suggester's cached "current" event with an on-demand refresh fallback.
+ */
+function initMeetingAndCalendar() {
+  dismissalRegistry = new DismissalRegistry({ store });
+
+  // Always construct the suggester so settings:update can start/stop it later
+  // even if the feature was off at boot. The source itself is cheap to hold
+  // (no background work until `start()`); permission isn't checked until the
+  // first helper invocation.
+  const calendarSource = new MacOSCalendarSource({
+    helperPath: getCalendarHelperPath(),
+    spawn: childSpawn,
+    registerProcess
+  });
+
+  calendarSuggester = new CalendarSuggester({
+    store,
+    source: calendarSource,
+    dismissalRegistry,
+    onSuggestion: (suggestion) => {
+      if (isRecordingActive()) return;
+      console.log(`Calendar suggestion: ${suggestion.event.title} (${suggestion.fingerprint})`);
+      createMeetingBanner({
+        app: 'calendar',
+        displayName: suggestion.event.title || 'Upcoming meeting',
+        fingerprint: suggestion.fingerprint,
+        calendarEvent: suggestion.event
+      });
+    }
+  });
+
+  // Meeting detector enricher: cache-first read with on-demand fallback.
+  // Returns the calendar event for the meeting currently in progress, or null.
+  const enricher = async () => {
+    if (!calendarSuggester) return null;
+    const cached = calendarSuggester.getCurrentMeetingEventSync();
+    if (cached) return cached;
+    return calendarSuggester.refreshCurrentEvent();
+  };
+
+  meetingDetector = new MeetingDetector({ dismissalRegistry, enricher });
   meetingDetector.onMeetingDetected((detection) => {
     // Defensive: if a recording started between polls, don't show the banner
     if (isRecordingActive()) return;
@@ -611,6 +744,7 @@ function initMeetingDetector() {
   if (store.get('meetingDetectionEnabled')) {
     meetingDetector.start();
   }
+  startCalendarSuggesterIfEnabled();
 }
 
 /**
@@ -623,8 +757,9 @@ function startRecordingWithContext(meetingContext) {
   // Reinitialize recorder so it picks up the new context
   initRecorder();
 
-  // Suspend meeting detection — no polling, no banners during a recording
+  // Suspend meeting detection and calendar suggestions — no polling or banners during a recording
   if (meetingDetector) meetingDetector.stop();
+  if (calendarSuggester) calendarSuggester.stop();
   closeMeetingBanner(false);
 
   const mode = store.get('recordingMode');
@@ -688,8 +823,9 @@ function startRecordingWithContext(meetingContext) {
   } catch (err) {
     console.error('Failed to start recording:', err);
 
-    // Recording failed — resume meeting detection since we're not actually recording
+    // Recording failed — resume meeting detection and calendar suggestions
     startMeetingDetectorIfEnabled();
+    startCalendarSuggesterIfEnabled();
 
     const errorMessage = err.message.split('\n')[0];
     showNotification('Cannot Start Recording', errorMessage, true);
@@ -724,17 +860,22 @@ async function handleStopRecording() {
 
   try {
     stopLevelMonitor();
-    startMeetingDetectorIfEnabled();
 
-    // Clear interval and update menu immediately (isRecording is set to false
-    // synchronously in both Recorder.stop() and DualTrackRecorder.stop())
+    // Kick off the stop FIRST — both Recorder.stop() and DualTrackRecorder.stop()
+    // flip isRecording=false synchronously before returning the promise. That
+    // synchronous flip must happen before the resume calls, otherwise
+    // isRecordingActive() is still true and they silently no-op (leaving
+    // detection + suggestions off until the user toggles the setting).
+    const stopPromise = useDual ? dualRecorder.stop() : recorder.stop();
+
+    startMeetingDetectorIfEnabled();
+    startCalendarSuggesterIfEnabled();
+
+    // Clear interval and update menu immediately
     if (statusUpdateInterval) {
       clearInterval(statusUpdateInterval);
       statusUpdateInterval = null;
     }
-
-    // Start stop but don't await yet — update UI first
-    const stopPromise = useDual ? dualRecorder.stop() : recorder.stop();
 
     updateTrayMenu();
 
@@ -1181,6 +1322,11 @@ function formatDuration(ms) {
 
 // Pre-record popup
 ipcMain.handle('prerecord:getContext', async () => {
+  // Prefer the calendar-derived seed if one was staged by "Take notes" on an
+  // enriched banner. Otherwise fall back to the saved meetingContext.
+  if (pendingPreRecordContext) {
+    return pendingPreRecordContext;
+  }
   return store.get('meetingContext') || { title: '', participants: '', agenda: '' };
 });
 
@@ -1191,6 +1337,9 @@ ipcMain.handle('prerecord:start', async (event, context) => {
   }
   // Start recording with the provided context
   startRecordingWithContext(context || {});
+  // Stale-context safety: clear the staged seed so the next manual recording
+  // does not inherit calendar context from this one.
+  pendingPreRecordContext = null;
   return { success: true };
 });
 
@@ -1198,6 +1347,7 @@ ipcMain.handle('prerecord:cancel', async () => {
   if (preRecordWindow && !preRecordWindow.isDestroyed()) {
     preRecordWindow.close();
   }
+  pendingPreRecordContext = null;
   return { success: true };
 });
 
@@ -1207,10 +1357,15 @@ ipcMain.handle('meeting:getContext', async () => {
 });
 
 ipcMain.handle('meeting:takeNotes', async () => {
-  // Mark dismissed so we don't re-fire for this meeting after the pre-record popup closes
-  if (currentDetection && meetingDetector) {
-    meetingDetector.markDismissed(currentDetection.fingerprint);
+  // Stage the calendar-derived seed for the pre-record popup BEFORE opening it,
+  // so prerecord:getContext returns the enriched values on first read.
+  if (currentDetection && currentDetection.calendarEvent) {
+    pendingPreRecordContext = buildPreRecordSeedFromEvent(currentDetection.calendarEvent);
+  } else {
+    pendingPreRecordContext = null;
   }
+  // Mark dismissed so we don't re-fire for this meeting after the pre-record popup closes
+  recordDismissal(currentDetection);
   closeMeetingBanner(false);
   showPreRecordPopup();
   return { success: true };
@@ -1221,11 +1376,34 @@ ipcMain.handle('meeting:dismiss', async () => {
   return { success: true };
 });
 
+// Calendar suggestions
+ipcMain.handle('calendar:getPermissionState', async () => {
+  if (!calendarSuggester) return 'not-determined';
+  return calendarSuggester.getPermissionState();
+});
+
+ipcMain.handle('calendar:requestPermission', async () => {
+  if (!calendarSuggester) return { state: 'not-determined' };
+  try {
+    const source = calendarSuggester.getSource();
+    const state = await source.ensurePermission();
+    return { state };
+  } catch (err) {
+    return { state: 'denied', error: err.message };
+  }
+});
+
+ipcMain.handle('calendar:openPrivacySettings', async () => {
+  await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars');
+  return { success: true };
+});
+
 // Recording Controls
 ipcMain.handle('recording:start', async () => {
   try {
-    // Suspend meeting detection for the duration of the recording
+    // Suspend meeting detection and calendar suggestions for the duration of the recording
     if (meetingDetector) meetingDetector.stop();
+    if (calendarSuggester) calendarSuggester.stop();
     closeMeetingBanner(false);
 
     const mode = store.get('recordingMode');
@@ -1247,8 +1425,9 @@ ipcMain.handle('recording:start', async () => {
     }
   } catch (err) {
     console.error('IPC recording:start failed:', err);
-    // Recording didn't start — resume detection
+    // Recording didn't start — resume detection and calendar suggestions
     startMeetingDetectorIfEnabled();
+    startCalendarSuggesterIfEnabled();
     return { success: false, error: err.message };
   }
 });
@@ -1256,12 +1435,18 @@ ipcMain.handle('recording:start', async () => {
 ipcMain.handle('recording:stop', async () => {
   try {
     stopLevelMonitor();
-    startMeetingDetectorIfEnabled();
     const mode = store.get('recordingMode');
     const useDual = mode === 'dual' && dualRecorder && dualRecorder.isRecording;
 
+    // Kick off the stop FIRST so isRecording flips to false synchronously,
+    // then resume detection + suggestions, then await the actual completion.
+    // Reversing this order makes the resume calls silently no-op.
+    const stopPromise = useDual ? dualRecorder.stop() : recorder.stop();
+    startMeetingDetectorIfEnabled();
+    startCalendarSuggesterIfEnabled();
+
     if (useDual) {
-      const result = await dualRecorder.stop();
+      const result = await stopPromise;
       tray.setToolTip('Notes4Chris');
       updateTrayMenu();
 
@@ -1284,7 +1469,7 @@ ipcMain.handle('recording:stop', async () => {
         micSize: result.micSize
       };
     } else {
-      const result = await recorder.stop();
+      const result = await stopPromise;
       tray.setToolTip('Notes4Chris');
       updateTrayMenu();
 
@@ -1749,7 +1934,10 @@ ipcMain.handle('settings:get', async () => {
     systemLabel: store.get('systemLabel'),
     micLabel: store.get('micLabel'),
     meetingContext: store.get('meetingContext'),
-    meetingDetectionEnabled: store.get('meetingDetectionEnabled')
+    meetingDetectionEnabled: store.get('meetingDetectionEnabled'),
+    calendarSuggestionsEnabled: store.get('calendarSuggestionsEnabled'),
+    calendarLeadTimeMinutes: store.get('calendarLeadTimeMinutes'),
+    calendarDenylist: store.get('calendarDenylist')
   };
 });
 
@@ -1789,6 +1977,33 @@ ipcMain.handle('settings:update', async (event, settings) => {
           meetingDetector.stop();
           closeMeetingBanner(false);
         }
+      }
+    }
+    if (settings.calendarSuggestionsEnabled !== undefined) {
+      store.set('calendarSuggestionsEnabled', settings.calendarSuggestionsEnabled);
+      // Apply immediately: start or stop the suggester based on the new value
+      if (calendarSuggester) {
+        if (settings.calendarSuggestionsEnabled) {
+          startCalendarSuggesterIfEnabled();
+        } else {
+          calendarSuggester.stop();
+        }
+      }
+    }
+    if (settings.calendarLeadTimeMinutes !== undefined) {
+      const n = Number(settings.calendarLeadTimeMinutes);
+      if (Number.isFinite(n) && n >= 0 && n <= 15) {
+        store.set('calendarLeadTimeMinutes', n);
+      }
+    }
+    if (settings.calendarDenylist !== undefined) {
+      // Accept array<string> only; ignore anything else
+      if (Array.isArray(settings.calendarDenylist)) {
+        const clean = settings.calendarDenylist
+          .filter(s => typeof s === 'string')
+          .map(s => s.trim())
+          .filter(Boolean);
+        store.set('calendarDenylist', clean);
       }
     }
 
@@ -1934,8 +2149,8 @@ app.whenReady().then(() => {
   // Run cleanup on startup
   runCleanup();
 
-  // Start the meeting detector (will no-op if the user has disabled it)
-  initMeetingDetector();
+  // Start the meeting detector + calendar suggester (each gates on its own setting)
+  initMeetingAndCalendar();
 
   console.log('Notes4Chris ready. Click the menu bar icon to start recording.');
 
@@ -1977,8 +2192,9 @@ app.on('window-all-closed', (e) => {
 app.on('before-quit', () => {
   console.log('App quitting, cleaning up...');
 
-  // Stop the meeting detector
+  // Stop the meeting detector and calendar suggester
   if (meetingDetector) meetingDetector.stop();
+  if (calendarSuggester) calendarSuggester.stop();
   closeMeetingBanner(false);
 
   // Stop level monitor

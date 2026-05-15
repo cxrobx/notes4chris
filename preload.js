@@ -61,6 +61,11 @@ contextBridge.exposeInMainWorld('meetingRecorder', {
   updateSettings: (settings) => ipcRenderer.invoke('settings:update', settings),
   resetSettings: () => ipcRenderer.invoke('settings:reset'),
 
+  // Calendar suggestions
+  getCalendarPermissionState: () => ipcRenderer.invoke('calendar:getPermissionState'),
+  requestCalendarPermission: () => ipcRenderer.invoke('calendar:requestPermission'),
+  openCalendarPrivacySettings: () => ipcRenderer.invoke('calendar:openPrivacySettings'),
+
   // ============================================
   // System Information
   // ============================================
