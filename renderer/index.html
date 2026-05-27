@@ -205,6 +205,27 @@
           </label>
         </div>
 
+        <div class="form-group">
+          <label class="checkbox-label">
+            <input type="checkbox" id="silence-autostop-enabled">
+            <span>
+              Auto-stop on prolonged silence
+              <small>Prompts when no one has spoken for a while, and auto-stops if ignored</small>
+            </span>
+          </label>
+        </div>
+
+        <div class="form-group">
+          <label for="silence-autostop-minutes">
+            Silence before prompting (minutes)
+            <small>How long both sides must stay silent before the "still recording?" prompt appears (1–60)</small>
+          </label>
+          <div class="input-with-slider">
+            <input type="number" id="silence-autostop-minutes" min="1" max="60" step="1" style="width: 80px;">
+            <span>minutes</span>
+          </div>
+        </div>
+
         <div class="info-notice">
           Meeting summaries are also exported to your Obsidian vault in <code>~/Documents/CX</code>.
         </div>

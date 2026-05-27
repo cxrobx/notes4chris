@@ -34,6 +34,7 @@ notes4chris/
 │   ├── meetingDetector.js     # App-based meeting detection (Zoom/FaceTime/Meet)
 │   ├── calendarSuggester.js   # 60s poll, filter rules, fire pre-meeting banners
 │   ├── dismissalRegistry.js   # Shared dismiss-state owner (consulted by both)
+│   ├── silenceWatcher.js      # Timer-free silence-streak state machine (auto-stop)
 │   └── calendarSources/       # Pluggable calendar source layer
 │       ├── index.js
 │       ├── macOSCalendarSource.js  # Spawns calendar-helper Swift CLI
@@ -81,6 +82,18 @@ Qualification: A rule belongs here if (1) violating it breaks the system in non-
 8. **Single dismiss-state source**: Banner dismissals MUST go through `DismissalRegistry`. The meeting detector and calendar suggester both consult the same registry so dismissing the pre-meeting banner suppresses the in-meeting banner for the same occurrence (and vice versa).
    - Why: Two independent dismissal sets would re-fire the banner the moment Zoom opens, defeating the whole point.
    - Pattern: `services/dismissalRegistry.js` → `isDismissed()` / `dismiss({ kind, expiry })`.
+
+9. **Single idempotent stop path**: Every stop trigger — tray menu, `recording:stop` IPC, silence prompt "Stop & save", and the silence grace-timer auto-stop — MUST route through `stopRecording()` in `main.js`. It carries an in-flight guard (`stopInProgress`) so concurrent triggers no-op rather than double-stopping.
+   - Why: The silence feature adds *two* new stop triggers; divergent stop paths (the old tray vs. IPC duplication) drift in behaviour and a double-stop can orphan sox/SCK processes.
+   - Pattern: `main.js` → `stopRecording()`; callers `handleStopRecording()`, IPC `recording:stop`, IPC `silence:stopNow`, `silenceGraceTimer`.
+
+10. **Silence detection never auto-stops on unknown audio**: The `SilenceWatcher` only counts toward auto-stop when the track files are present **and growing** (`healthy:true`). `LevelMonitor` returns level `0` on read failure, indistinguishable from silence — a stalled/failed recorder must not masquerade as a finished meeting. Detection prompts (with a grace timer), never silently stops.
+   - Why: The whole risk surface is accidentally killing a valid recording; the prompt-then-grace design is the safety net for the SCK zero-fill case (gotchas #5).
+   - Pattern: `services/silenceWatcher.js` → `update(levels, { healthy })`; health computed in `main.js` `startLevelMonitor()`.
+
+11. **No recorder reinit mid-recording**: `settings:update` MUST skip `initRecorder()` while a recording is active (`isRecordingActive()`). Swapping the `recorder`/`dualRecorder` references mid-capture orphans the live processes; recorder-affecting settings apply on the next start.
+   - Why: The always-wired Save button makes a mid-recording settings save reachable; saving silence settings during a recording must not tear down the live recorder.
+   - Pattern: `main.js` IPC `settings:update` → `if (!isRecordingActive()) initRecorder();`.
 
 ## Key Patterns
 

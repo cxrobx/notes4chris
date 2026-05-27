@@ -23,6 +23,7 @@ console.log('PATH:', process.env.PATH);
 
 const { Recorder, DualTrackRecorder } = require('./services/recorder');
 const { LevelMonitor } = require('./services/levelMonitor');
+const { SilenceWatcher } = require('./services/silenceWatcher');
 const { transcribe, transcribeSession, verifyInstallation: verifyWhisper } = require('./services/transcriber');
 const { generateNotes, generateSessionNotes, exportNotesToObsidian, isCodexAvailable, isClaudeAvailable } = require('./services/summariser');
 const { ensureDirectoryStructure, cleanupOldRecordings, getStorageStats } = require('./services/fileManager');
@@ -57,9 +58,21 @@ const store = new Store({
     calendarSuggestionsEnabled: false,
     calendarLeadTimeMinutes: 2,
     calendarDenylist: ['Lunch', 'Gym', 'Focus', 'Block', 'OOO', 'Holiday'],
-    calendarDismissedFingerprints: []
+    calendarDismissedFingerprints: [],
+    silenceAutoStopEnabled: true,
+    silenceAutoStopMinutes: 5
   }
 });
+
+/**
+ * Clamp the configured silence-auto-stop minutes to a sane 1..60 range.
+ * Used both when arming the watcher and when validating settings:update.
+ */
+function clampSilenceMinutes(value) {
+  const n = Math.round(Number(value));
+  if (!Number.isFinite(n)) return 5;
+  return Math.max(1, Math.min(60, n));
+}
 
 let tray = null;
 let settingsWindow = null;
@@ -78,6 +91,10 @@ let statusUpdateInterval = null;
 let levelMonitor = null;
 let trayIcon = null;
 let latestLevels = { system: 0, mic: 0 };
+let silenceWatcher = null;          // SilenceWatcher (or null when disabled)
+let silencePromptWindow = null;     // frameless "still recording?" banner
+let silenceGraceTimer = null;       // authoritative grace timer before auto-stop
+let stopInProgress = false;         // in-flight guard for the single stop path
 
 // Track processing state so the renderer can catch up
 let processingState = null; // { path, stage, progress, message }
@@ -852,13 +869,36 @@ function startRecordingWithContext(meetingContext) {
 }
 
 /**
- * Stop recording handler
+ * The single, idempotent stop path.
+ *
+ * Every stop trigger — the tray menu, the `recording:stop` IPC, the silence
+ * prompt's "Stop & save" button, and the grace-timer auto-stop — routes through
+ * here. The in-flight guard makes a "user clicks Stop just as the grace timer
+ * fires" race harmless: the second caller no-ops.
+ *
+ * @returns {Promise<object>} normalised result:
+ *   - `{ success:false, skipped:true }`           — nothing to stop / already stopping
+ *   - `{ success:true, mode:'dual', sessionDir, duration, systemSize, micSize }`
+ *   - `{ success:true, mode:'system', filepath, duration, size }`
+ *   - `{ success:false, error }`                  — stop threw
  */
-async function handleStopRecording() {
+async function stopRecording() {
+  if (stopInProgress) {
+    return { success: false, skipped: true };
+  }
+  if (!isRecordingActive()) {
+    // Nothing to stop; still tear down any orphaned prompt/timer.
+    closeSilencePrompt({ cancelTimer: true });
+    return { success: false, skipped: true };
+  }
+
+  stopInProgress = true;
+
   const mode = store.get('recordingMode');
   const useDual = mode === 'dual' && dualRecorder && dualRecorder.isRecording;
 
   try {
+    // stopLevelMonitor() also tears down the silence watcher + any open prompt.
     stopLevelMonitor();
 
     // Kick off the stop FIRST — both Recorder.stop() and DualTrackRecorder.stop()
@@ -871,12 +911,12 @@ async function handleStopRecording() {
     startMeetingDetectorIfEnabled();
     startCalendarSuggesterIfEnabled();
 
-    // Clear interval and update menu immediately
+    // Clear interval and update tray immediately
     if (statusUpdateInterval) {
       clearInterval(statusUpdateInterval);
       statusUpdateInterval = null;
     }
-
+    if (tray) tray.setToolTip('Notes4Chris');
     updateTrayMenu();
 
     // Notify settings window immediately
@@ -887,6 +927,7 @@ async function handleStopRecording() {
 
     // Now await the actual stop result for logging and auto-processing
     const result = await stopPromise;
+    const autoProcess = store.get('autoProcess');
 
     if (useDual) {
       console.log(`Dual recording stopped: ${result.sessionDir}`);
@@ -894,26 +935,44 @@ async function handleStopRecording() {
       console.log(`System: ${(result.systemSize / (1024 * 1024)).toFixed(2)} MB`);
       console.log(`Mic: ${(result.micSize / (1024 * 1024)).toFixed(2)} MB`);
 
-      const autoProcess = store.get('autoProcess');
       if (autoProcess) {
         processSession(result.sessionDir, result.duration).catch(err => {
-          console.error('Auto-processing session failed (tray):', err);
+          console.error('Auto-processing session failed:', err);
+          showNotification('Processing Error', `Failed: ${err.message.split('\n')[0]}`, true);
+          if (settingsWindow && !settingsWindow.isDestroyed()) {
+            settingsWindow.webContents.send('processing:complete', { error: err.message });
+          }
         });
       }
+
+      return {
+        success: true,
+        mode: 'dual',
+        sessionDir: result.sessionDir,
+        duration: result.duration,
+        systemSize: result.systemSize,
+        micSize: result.micSize
+      };
     } else {
       console.log(`Recording stopped: ${result.filepath}`);
       console.log(`Duration: ${formatDuration(result.duration)}`);
       console.log(`Size: ${(result.size / (1024 * 1024)).toFixed(2)} MB`);
 
-      const autoProcess = store.get('autoProcess');
       if (autoProcess) {
         processRecording(result.filepath, result.duration).catch(err => {
-          console.error('Auto-processing recording failed (tray):', err);
+          console.error('Auto-processing recording failed:', err);
           showNotification('Processing Error', `Failed: ${err.message.split('\n')[0]}`, true);
         });
       }
-    }
 
+      return {
+        success: true,
+        mode: 'system',
+        filepath: result.filepath,
+        duration: result.duration,
+        size: result.size
+      };
+    }
   } catch (err) {
     console.error('Failed to stop recording:', err);
 
@@ -928,7 +987,17 @@ async function handleStopRecording() {
       settingsWindow.webContents.send('companion-mode-status', { active: false });
     }
     showNotification('Recording Error', `Failed to stop: ${err.message}`, true);
+    return { success: false, error: err.message };
+  } finally {
+    stopInProgress = false;
   }
+}
+
+/**
+ * Tray "Stop Recording" handler — thin wrapper over the one stop path.
+ */
+async function handleStopRecording() {
+  await stopRecording();
 }
 
 /**
@@ -944,8 +1013,27 @@ function levelToBar(level) {
 /**
  * Start polling WAV files for audio levels and sending to the settings window + tray
  */
+const WAV_HEADER_BYTES = 44;
+
 function startLevelMonitor(isDual) {
   stopLevelMonitor();
+
+  // Arm the prolonged-silence auto-stop watcher if enabled. It owns no timers;
+  // it is driven by the level-monitor poll below.
+  if (store.get('silenceAutoStopEnabled')) {
+    const minutes = clampSilenceMinutes(store.get('silenceAutoStopMinutes'));
+    silenceWatcher = new SilenceWatcher({
+      requiredSilenceMs: minutes * 60000,
+      mode: isDual ? 'dual' : 'system',
+      onTrigger: showSilencePrompt,
+      onResume: () => closeSilencePrompt({ cancelTimer: true, resetWatcher: true })
+    });
+  }
+
+  // Per-track file sizes from the previous poll, used to compute the `healthy`
+  // flag (track present AND growing). A non-growing/unreadable track is treated
+  // as "unknown", not silence (hazard #4).
+  const lastTrackSizes = {};
 
   levelMonitor = new LevelMonitor((levels) => {
     // Store latest levels for tray menu display
@@ -963,6 +1051,23 @@ function startLevelMonitor(isDual) {
       tray.setTitle(`S${sysBar} M${micBar}`);
     } else {
       tray.setTitle(`S${sysBar}`);
+    }
+
+    // Feed the silence watcher with the per-poll levels + a health flag.
+    if (silenceWatcher && levelMonitor) {
+      let healthy = true;
+      for (const [name, track] of Object.entries(levelMonitor.tracks)) {
+        let grew = false;
+        try {
+          const size = fs.statSync(track.path).size;
+          grew = size > (lastTrackSizes[name] || 0) && size > WAV_HEADER_BYTES;
+          lastTrackSizes[name] = size;
+        } catch {
+          grew = false; // unreadable → unknown, not silence
+        }
+        if (!grew) healthy = false;
+      }
+      silenceWatcher.update(levels, { healthy });
     }
   });
 
@@ -986,6 +1091,104 @@ function stopLevelMonitor() {
   }
   if (tray) {
     tray.setTitle('');
+  }
+  // A stop from ANY trigger tears down an open silence prompt + grace timer.
+  // resetWatcher:false because we null the watcher outright below.
+  closeSilencePrompt({ cancelTimer: true, resetWatcher: false });
+  silenceWatcher = null;
+}
+
+/**
+ * ============================================
+ * Prolonged-silence auto-stop prompt
+ * ============================================
+ */
+const SILENCE_PROMPT_WIDTH = 460;
+const SILENCE_PROMPT_HEIGHT = 92;
+const SILENCE_GRACE_MS = 60000;
+
+/**
+ * Show the "No audio detected — still recording?" prompt. Fired by the
+ * SilenceWatcher's onTrigger. Starts the authoritative grace timer that
+ * auto-stops the recording if the user ignores the prompt.
+ */
+function showSilencePrompt() {
+  // Guard: no point prompting if nothing is recording, and never stack prompts.
+  if (!isRecordingActive()) return;
+  if (silencePromptWindow && !silencePromptWindow.isDestroyed()) return;
+
+  const display = screen.getPrimaryDisplay();
+  const { x: workX, y: workY, width: workWidth } = display.workArea;
+  const x = Math.round(workX + (workWidth - SILENCE_PROMPT_WIDTH) / 2);
+  const y = workY + 8;
+
+  silencePromptWindow = new BrowserWindow({
+    width: SILENCE_PROMPT_WIDTH,
+    height: SILENCE_PROMPT_HEIGHT,
+    x,
+    y,
+    frame: false,
+    transparent: true,
+    hasShadow: true,
+    alwaysOnTop: true,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    skipTaskbar: true,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload-silence-prompt.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true
+    }
+  });
+
+  silencePromptWindow.loadFile(path.join(__dirname, 'renderer', 'silence-prompt.html'));
+  silencePromptWindow.setAlwaysOnTop(true, 'floating');
+
+  silencePromptWindow.once('ready-to-show', () => {
+    if (silencePromptWindow && !silencePromptWindow.isDestroyed()) {
+      silencePromptWindow.show();
+    }
+  });
+
+  silencePromptWindow.on('closed', () => {
+    silencePromptWindow = null;
+    if (silenceGraceTimer) {
+      clearTimeout(silenceGraceTimer);
+      silenceGraceTimer = null;
+    }
+  });
+
+  // Authoritative grace timer. The renderer countdown is cosmetic only — this
+  // is what actually fires the auto-stop. The stopRecording() in-flight guard
+  // covers the race with a user click.
+  silenceGraceTimer = setTimeout(() => {
+    silenceGraceTimer = null;
+    stopRecording();
+  }, SILENCE_GRACE_MS);
+}
+
+/**
+ * The single dismissal path for the silence prompt (hazard #5). Every way the
+ * prompt goes away routes through here.
+ *
+ * @param {object} opts
+ * @param {boolean} [opts.cancelTimer=false] - clear the grace timer.
+ * @param {boolean} [opts.resetWatcher=false] - re-arm the watcher for the next
+ *   silent window (used when the recording continues).
+ */
+function closeSilencePrompt({ cancelTimer = false, resetWatcher = false } = {}) {
+  if (cancelTimer && silenceGraceTimer) {
+    clearTimeout(silenceGraceTimer);
+    silenceGraceTimer = null;
+  }
+  if (silencePromptWindow && !silencePromptWindow.isDestroyed()) {
+    silencePromptWindow.close();
+  }
+  if (resetWatcher && silenceWatcher) {
+    silenceWatcher.reset();
   }
 }
 
@@ -1376,6 +1579,27 @@ ipcMain.handle('meeting:dismiss', async () => {
   return { success: true };
 });
 
+// Prolonged-silence auto-stop prompt
+ipcMain.handle('silence:getContext', async () => {
+  return {
+    minutes: clampSilenceMinutes(store.get('silenceAutoStopMinutes')),
+    graceSeconds: SILENCE_GRACE_MS / 1000
+  };
+});
+
+ipcMain.handle('silence:keepRecording', async () => {
+  // ✕ and "Keep recording" share this: cancel the auto-stop, re-arm the watcher.
+  closeSilencePrompt({ cancelTimer: true, resetWatcher: true });
+  return { success: true };
+});
+
+ipcMain.handle('silence:stopNow', async () => {
+  // Cancel the timer first so it can't race the explicit stop, then stop.
+  closeSilencePrompt({ cancelTimer: true });
+  await stopRecording();
+  return { success: true };
+});
+
 // Calendar suggestions
 ipcMain.handle('calendar:getPermissionState', async () => {
   if (!calendarSuggester) return 'not-determined';
@@ -1433,64 +1657,31 @@ ipcMain.handle('recording:start', async () => {
 });
 
 ipcMain.handle('recording:stop', async () => {
-  try {
-    stopLevelMonitor();
-    const mode = store.get('recordingMode');
-    const useDual = mode === 'dual' && dualRecorder && dualRecorder.isRecording;
+  // The single guarded stop path owns interval cleanup, detection/suggester
+  // resume, tray, renderer notifications, and auto-processing. This handler only
+  // shapes the result for the renderer's invoke() caller.
+  const result = await stopRecording();
 
-    // Kick off the stop FIRST so isRecording flips to false synchronously,
-    // then resume detection + suggestions, then await the actual completion.
-    // Reversing this order makes the resume calls silently no-op.
-    const stopPromise = useDual ? dualRecorder.stop() : recorder.stop();
-    startMeetingDetectorIfEnabled();
-    startCalendarSuggesterIfEnabled();
-
-    if (useDual) {
-      const result = await stopPromise;
-      tray.setToolTip('Notes4Chris');
-      updateTrayMenu();
-
-      const autoProcess = store.get('autoProcess');
-      if (autoProcess) {
-        processSession(result.sessionDir, result.duration).catch(err => {
-          console.error('Auto-processing failed:', err);
-          showNotification('Processing Error', `Failed: ${err.message.split('\n')[0]}`, true);
-          if (settingsWindow && !settingsWindow.isDestroyed()) {
-            settingsWindow.webContents.send('processing:complete', { error: err.message });
-          }
-        });
-      }
-
-      return {
-        success: true,
-        sessionDir: result.sessionDir,
-        duration: result.duration,
-        systemSize: result.systemSize,
-        micSize: result.micSize
-      };
-    } else {
-      const result = await stopPromise;
-      tray.setToolTip('Notes4Chris');
-      updateTrayMenu();
-
-      const autoProcess = store.get('autoProcess');
-      if (autoProcess) {
-        processRecording(result.filepath, result.duration).catch(err => {
-          console.error('Auto-processing failed:', err);
-        });
-      }
-
-      return {
-        success: true,
-        filepath: result.filepath,
-        duration: result.duration,
-        size: result.size
-      };
-    }
-  } catch (err) {
-    console.error('IPC recording:stop failed:', err);
-    return { success: false, error: err.message };
+  if (!result.success) {
+    return { success: false, error: result.error, skipped: result.skipped };
   }
+
+  if (result.mode === 'dual') {
+    return {
+      success: true,
+      sessionDir: result.sessionDir,
+      duration: result.duration,
+      systemSize: result.systemSize,
+      micSize: result.micSize
+    };
+  }
+
+  return {
+    success: true,
+    filepath: result.filepath,
+    duration: result.duration,
+    size: result.size
+  };
 });
 
 ipcMain.handle('recording:status', async () => {
@@ -1937,7 +2128,9 @@ ipcMain.handle('settings:get', async () => {
     meetingDetectionEnabled: store.get('meetingDetectionEnabled'),
     calendarSuggestionsEnabled: store.get('calendarSuggestionsEnabled'),
     calendarLeadTimeMinutes: store.get('calendarLeadTimeMinutes'),
-    calendarDenylist: store.get('calendarDenylist')
+    calendarDenylist: store.get('calendarDenylist'),
+    silenceAutoStopEnabled: store.get('silenceAutoStopEnabled'),
+    silenceAutoStopMinutes: store.get('silenceAutoStopMinutes')
   };
 });
 
@@ -2006,9 +2199,40 @@ ipcMain.handle('settings:update', async (event, settings) => {
         store.set('calendarDenylist', clean);
       }
     }
+    if (settings.silenceAutoStopEnabled !== undefined) {
+      if (typeof settings.silenceAutoStopEnabled === 'boolean') {
+        store.set('silenceAutoStopEnabled', settings.silenceAutoStopEnabled);
+      }
+    }
+    if (settings.silenceAutoStopMinutes !== undefined) {
+      store.set('silenceAutoStopMinutes', clampSilenceMinutes(settings.silenceAutoStopMinutes));
+    }
 
-    // Reinitialize recorder with new settings
-    initRecorder();
+    // Live-apply silence settings to an in-flight watcher (nice-to-have): if a
+    // watcher exists, update its required-silence window in place. Otherwise the
+    // new values simply take effect on the next recording.
+    if (silenceWatcher) {
+      if (settings.silenceAutoStopMinutes !== undefined) {
+        silenceWatcher.requiredSilenceMs = clampSilenceMinutes(settings.silenceAutoStopMinutes) * 60000;
+      }
+      // If the user disabled the feature mid-recording, tear the watcher (and any
+      // open prompt) down so it can't fire.
+      if (settings.silenceAutoStopEnabled === false) {
+        closeSilencePrompt({ cancelTimer: true });
+        silenceWatcher = null;
+      }
+    }
+
+    // Reinitialize recorder with new settings — but NOT while a recording is
+    // active (hazard #3). Swapping the recorder/dualRecorder references mid-
+    // recording would orphan the live capture processes. Mode/mic/output/label
+    // changes can't safely apply mid-recording anyway, so we defer reinit to the
+    // next start; this also makes saving the new silence settings mid-recording safe.
+    if (!isRecordingActive()) {
+      initRecorder();
+    } else {
+      console.log('settings:update — skipping initRecorder() while a recording is active');
+    }
 
     return { success: true };
   } catch (err) {

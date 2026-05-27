@@ -65,6 +65,15 @@ async function loadSettings() {
     document.getElementById('meeting-detection-enabled').checked =
       currentSettings.meetingDetectionEnabled !== false;
 
+    // Silence auto-stop fields
+    const silenceToggle = document.getElementById('silence-autostop-enabled');
+    if (silenceToggle) silenceToggle.checked = currentSettings.silenceAutoStopEnabled !== false;
+    const silenceMinutes = document.getElementById('silence-autostop-minutes');
+    if (silenceMinutes) {
+      const m = Number(currentSettings.silenceAutoStopMinutes);
+      silenceMinutes.value = Number.isFinite(m) ? m : 5;
+    }
+
     // Calendar suggestion fields
     const calToggle = document.getElementById('calendar-suggestions-enabled');
     if (calToggle) calToggle.checked = currentSettings.calendarSuggestionsEnabled === true;
@@ -692,6 +701,14 @@ async function handleSaveSettings() {
       ? calDenylist.value.split('\n').map(s => s.trim()).filter(Boolean)
       : [];
 
+    // Silence auto-stop settings
+    const silenceToggle = document.getElementById('silence-autostop-enabled');
+    const silenceMinutesInput = document.getElementById('silence-autostop-minutes');
+    const silenceAutoStopEnabled = silenceToggle ? silenceToggle.checked : true;
+    const silenceAutoStopMinutes = silenceMinutesInput
+      ? Math.max(1, Math.min(60, parseInt(silenceMinutesInput.value, 10) || 5))
+      : 5;
+
     const newSettings = {
       outputDirectory: document.getElementById('output-directory').value,
       retentionDays: parseInt(document.getElementById('retention-days').value),
@@ -703,7 +720,9 @@ async function handleSaveSettings() {
       micLabel: document.getElementById('mic-label').value || 'Me',
       calendarSuggestionsEnabled,
       calendarLeadTimeMinutes,
-      calendarDenylist
+      calendarDenylist,
+      silenceAutoStopEnabled,
+      silenceAutoStopMinutes
     };
 
     const result = await api.updateSettings(newSettings);
