@@ -23,7 +23,7 @@ console.log('PATH:', process.env.PATH);
 
 const { Recorder, DualTrackRecorder } = require('./services/recorder');
 const { LevelMonitor } = require('./services/levelMonitor');
-const { SilenceWatcher, classifyTrackGrowth, DEFAULT_STALL_TIMEOUT_MS } = require('./services/silenceWatcher');
+const { SilenceWatcher, computeTrackHealth, DEFAULT_STALL_TIMEOUT_MS } = require('./services/silenceWatcher');
 const { transcribe, transcribeSession, verifyInstallation: verifyWhisper } = require('./services/transcriber');
 const { generateNotes, generateSessionNotes, exportNotesToObsidian, isCodexAvailable, isClaudeAvailable } = require('./services/summariser');
 const { ensureDirectoryStructure, cleanupOldRecordings, getStorageStats } = require('./services/fileManager');
@@ -1011,6 +1011,19 @@ function levelToBar(level) {
 }
 
 /**
+ * Read a file's size in bytes, or null if unreadable (missing/locked). The sole
+ * impure dependency injected into `computeTrackHealth` — kept here so the shared
+ * health logic stays free of `fs`.
+ */
+function statSizeOrNull(filePath) {
+  try {
+    return fs.statSync(filePath).size;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Start polling WAV files for audio levels and sending to the settings window + tray
  */
 function startLevelMonitor(isDual) {
@@ -1055,21 +1068,16 @@ function startLevelMonitor(isDual) {
 
     // Feed the silence watcher with the per-poll levels + a per-track health map
     // (live / unknown / ended). A single stalled track no longer poisons the
-    // whole decision — silence is judged over the live tracks only.
+    // whole decision — silence is judged over the live tracks only. The health
+    // computation is shared with the tests via `computeTrackHealth`.
     if (silenceWatcher && levelMonitor) {
-      const trackHealth = {};
-      const now = Date.now();
-      for (const [name, track] of Object.entries(levelMonitor.tracks)) {
-        let size = null;
-        try {
-          size = fs.statSync(track.path).size;
-        } catch {
-          size = null; // unreadable → classifyTrackGrowth treats as no-growth
-        }
-        const state = classifyTrackGrowth(trackGrowth[name], size, now, DEFAULT_STALL_TIMEOUT_MS);
-        trackGrowth[name] = state;
-        trackHealth[name] = state.status;
-      }
+      const trackHealth = computeTrackHealth({
+        tracks: levelMonitor.tracks,
+        trackGrowth,
+        now: Date.now(),
+        stallMs: DEFAULT_STALL_TIMEOUT_MS,
+        readSize: statSizeOrNull,
+      });
       silenceWatcher.update(levels, { trackHealth });
     }
   });

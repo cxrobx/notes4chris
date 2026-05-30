@@ -6,6 +6,7 @@ const assert = require('node:assert');
 const {
   SilenceWatcher,
   classifyTrackGrowth,
+  computeTrackHealth,
   DEFAULT_STALL_TIMEOUT_MS,
 } = require('./silenceWatcher');
 
@@ -231,6 +232,44 @@ test('classify: shrink → not live, keeps prior size', () => {
   const r = classifyTrackGrowth({ lastSize: 200, lastGrowthAt: 0 }, 100, 10, STALL);
   assert.notEqual(r.status, 'live');
   assert.equal(r.lastSize, 200);
+});
+
+// ---------------------------------------------------------------------------
+// computeTrackHealth (shared poll body — pure given an injected readSize)
+// ---------------------------------------------------------------------------
+
+test('computeTrackHealth: maps each track to its status and mutates trackGrowth', () => {
+  const tracks = { system: { path: '/sys' }, mic: { path: '/mic' } };
+  const trackGrowth = {};
+  const sizes = { '/sys': 1000, '/mic': 1000 };
+  const readSize = (p) => sizes[p];
+
+  // First poll: both grow from nothing → live.
+  let health = computeTrackHealth({ tracks, trackGrowth, now: 0, stallMs: STALL, readSize });
+  assert.deepEqual(health, { system: 'live', mic: 'live' });
+  assert.equal(trackGrowth.system.lastGrowthAt, 0);
+  assert.equal(trackGrowth.mic.lastSize, 1000);
+
+  // System stalls (size frozen), mic keeps growing. Brief → system 'unknown'.
+  sizes['/mic'] = 2000;
+  health = computeTrackHealth({ tracks, trackGrowth, now: 1000, stallMs: STALL, readSize });
+  assert.deepEqual(health, { system: 'unknown', mic: 'live' });
+
+  // System stalled >= stallMs → 'ended'; mic still growing → 'live'.
+  sizes['/mic'] = 3000;
+  health = computeTrackHealth({ tracks, trackGrowth, now: STALL, stallMs: STALL, readSize });
+  assert.deepEqual(health, { system: 'ended', mic: 'live' });
+});
+
+test('computeTrackHealth: unreadable size (readSize → null) is treated as no-growth', () => {
+  const tracks = { system: { path: '/sys' } };
+  const trackGrowth = {};
+  const readSize = () => null; // always unreadable
+
+  const first = computeTrackHealth({ tracks, trackGrowth, now: 0, stallMs: STALL, readSize });
+  assert.deepEqual(first, { system: 'unknown' }); // first poll, never ended
+  const later = computeTrackHealth({ tracks, trackGrowth, now: STALL, stallMs: STALL, readSize });
+  assert.deepEqual(later, { system: 'ended' });
 });
 
 // ---------------------------------------------------------------------------

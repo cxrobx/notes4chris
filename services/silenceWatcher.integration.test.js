@@ -5,12 +5,13 @@
  * `silenceWatcher.test.js` can't reach. Those tests feed `classifyTrackGrowth`
  * plain numbers; here we exercise the real on-disk chain against actual files:
  *
- *   fs.statSync(path).size  →  classifyTrackGrowth(...)  →  trackHealth  →  watcher.update()
+ *   fs.statSync(path).size  →  computeTrackHealth(...)  →  watcher.update()
  *
- * `poll()` below is a faithful copy of `main.js` `startLevelMonitor()`'s per-poll
- * body (main.js ~lines 1059-1073). Files are real and grown/stalled on disk; only
- * the clock is injected, so a 120s stall and an N-minute streak collapse to
- * milliseconds. No Electron, no audio, no waiting.
+ * `poll()` below calls the SAME `computeTrackHealth` that `main.js`
+ * `startLevelMonitor()` runs in production — only the injected `readSize` reader
+ * differs (both are a try/statSync/catch). Files are real and grown/stalled on
+ * disk; only the clock is injected, so a 120s stall and an N-minute streak
+ * collapse to milliseconds. No Electron, no audio, no waiting.
  */
 
 const fs = require('node:fs');
@@ -19,7 +20,16 @@ const path = require('node:path');
 const { test } = require('node:test');
 const assert = require('node:assert');
 
-const { SilenceWatcher, classifyTrackGrowth } = require('./silenceWatcher');
+const { SilenceWatcher, computeTrackHealth } = require('./silenceWatcher');
+
+/** Real on-disk size reader, mirroring main.js `statSizeOrNull`. */
+function readSize(filePath) {
+  try {
+    return fs.statSync(filePath).size;
+  } catch {
+    return null;
+  }
+}
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'n4c-silence-'));
@@ -56,18 +66,7 @@ function makeRig({ dir, requiredSilenceMs = 1000, stallMs = 1000, mode = 'dual' 
   const trackGrowth = {};
 
   const poll = (levels) => {
-    const trackHealth = {};
-    for (const [name, track] of Object.entries(tracks)) {
-      let size = null;
-      try {
-        size = fs.statSync(track.path).size;
-      } catch {
-        size = null; // unreadable → classifyTrackGrowth treats as no-growth
-      }
-      const state = classifyTrackGrowth(trackGrowth[name], size, clock.t, stallMs);
-      trackGrowth[name] = state;
-      trackHealth[name] = state.status;
-    }
+    const trackHealth = computeTrackHealth({ tracks, trackGrowth, now: clock.t, stallMs, readSize });
     watcher.update(levels, { trackHealth });
   };
 

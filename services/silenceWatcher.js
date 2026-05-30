@@ -87,6 +87,36 @@ function classifyTrackGrowth(prev, size, now, stallMs) {
   return { status, lastSize: prev.lastSize, lastGrowthAt: prev.lastGrowthAt };
 }
 
+/**
+ * Build one poll's per-track health map (`{ name: 'live'|'unknown'|'ended' }`)
+ * to hand to `SilenceWatcher.update`. This is the exact per-poll body run by
+ * `main.js startLevelMonitor()` — kept here, and shared, so the production path
+ * and its tests can never drift.
+ *
+ * Pure given `readSize`: the sole impure dependency (reading file sizes off
+ * disk) is injected, so this module stays free of `fs`/electron and runs under
+ * plain node. Mutates `trackGrowth` in place, storing each track's new growth
+ * state for the next poll, and returns the status map.
+ *
+ * @param {object} opts
+ * @param {Object<string, {path: string}>} opts.tracks - `LevelMonitor.tracks` shape.
+ * @param {Object<string, object>} opts.trackGrowth - Prior per-track growth state; mutated in place.
+ * @param {number} opts.now - Current wall-clock time (ms).
+ * @param {number} opts.stallMs - Stall timeout before a non-growing track is 'ended'.
+ * @param {(path: string) => (number|null)} opts.readSize - Size in bytes, or null if unreadable.
+ * @returns {Object<string, 'live'|'unknown'|'ended'>}
+ */
+function computeTrackHealth({ tracks, trackGrowth, now, stallMs, readSize }) {
+  const trackHealth = {};
+  for (const [name, track] of Object.entries(tracks)) {
+    const size = readSize(track.path);
+    const state = classifyTrackGrowth(trackGrowth[name], size, now, stallMs);
+    trackGrowth[name] = state;
+    trackHealth[name] = state.status;
+  }
+  return trackHealth;
+}
+
 class SilenceWatcher {
   /**
    * @param {object} opts
@@ -180,6 +210,7 @@ class SilenceWatcher {
 module.exports = {
   SilenceWatcher,
   classifyTrackGrowth,
+  computeTrackHealth,
   DEFAULT_THRESHOLD_LEVEL,
   DEFAULT_STALL_TIMEOUT_MS,
   WAV_HEADER_BYTES,
