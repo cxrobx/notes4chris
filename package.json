@@ -11,7 +11,9 @@
     "prebuild": "npm run build:native",
     "build": "electron-builder",
     "postinstall": "electron-builder install-app-deps",
-    "summaryonly": "node summarise-only.js"
+    "summaryonly": "node summarise-only.js",
+    "test": "node --test '**/*.test.js'",
+    "test:watch": "node --test --watch '**/*.test.js'"
   },
   "keywords": [
     "meeting",
@@ -67,6 +69,7 @@
     "files": [
       "**/*",
       "!**/*.md",
+      "!**/*.test.js",
       "!.gitignore",
       "!_devnotes",
       "!whisper.cpp",

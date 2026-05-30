@@ -23,7 +23,7 @@ console.log('PATH:', process.env.PATH);
 
 const { Recorder, DualTrackRecorder } = require('./services/recorder');
 const { LevelMonitor } = require('./services/levelMonitor');
-const { SilenceWatcher } = require('./services/silenceWatcher');
+const { SilenceWatcher, classifyTrackGrowth, DEFAULT_STALL_TIMEOUT_MS } = require('./services/silenceWatcher');
 const { transcribe, transcribeSession, verifyInstallation: verifyWhisper } = require('./services/transcriber');
 const { generateNotes, generateSessionNotes, exportNotesToObsidian, isCodexAvailable, isClaudeAvailable } = require('./services/summariser');
 const { ensureDirectoryStructure, cleanupOldRecordings, getStorageStats } = require('./services/fileManager');
@@ -1013,8 +1013,6 @@ function levelToBar(level) {
 /**
  * Start polling WAV files for audio levels and sending to the settings window + tray
  */
-const WAV_HEADER_BYTES = 44;
-
 function startLevelMonitor(isDual) {
   stopLevelMonitor();
 
@@ -1030,10 +1028,12 @@ function startLevelMonitor(isDual) {
     });
   }
 
-  // Per-track file sizes from the previous poll, used to compute the `healthy`
-  // flag (track present AND growing). A non-growing/unreadable track is treated
-  // as "unknown", not silence (hazard #4).
-  const lastTrackSizes = {};
+  // Per-track growth state from the previous poll, used to classify each track
+  // as live / unknown / ended (see `classifyTrackGrowth`). A brief stall is
+  // "unknown" (transient, pauses the watcher — hazard #4/#5); a long stall is
+  // "ended" (dead capture, excluded from the silence test). Kept as a closure
+  // local so per-session growth state never leaks across recordings.
+  const trackGrowth = {};
 
   levelMonitor = new LevelMonitor((levels) => {
     // Store latest levels for tray menu display
@@ -1053,21 +1053,24 @@ function startLevelMonitor(isDual) {
       tray.setTitle(`S${sysBar}`);
     }
 
-    // Feed the silence watcher with the per-poll levels + a health flag.
+    // Feed the silence watcher with the per-poll levels + a per-track health map
+    // (live / unknown / ended). A single stalled track no longer poisons the
+    // whole decision — silence is judged over the live tracks only.
     if (silenceWatcher && levelMonitor) {
-      let healthy = true;
+      const trackHealth = {};
+      const now = Date.now();
       for (const [name, track] of Object.entries(levelMonitor.tracks)) {
-        let grew = false;
+        let size = null;
         try {
-          const size = fs.statSync(track.path).size;
-          grew = size > (lastTrackSizes[name] || 0) && size > WAV_HEADER_BYTES;
-          lastTrackSizes[name] = size;
+          size = fs.statSync(track.path).size;
         } catch {
-          grew = false; // unreadable → unknown, not silence
+          size = null; // unreadable → classifyTrackGrowth treats as no-growth
         }
-        if (!grew) healthy = false;
+        const state = classifyTrackGrowth(trackGrowth[name], size, now, DEFAULT_STALL_TIMEOUT_MS);
+        trackGrowth[name] = state;
+        trackHealth[name] = state.status;
       }
-      silenceWatcher.update(levels, { healthy });
+      silenceWatcher.update(levels, { trackHealth });
     }
   });
 
