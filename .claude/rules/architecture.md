@@ -35,10 +35,20 @@ notes4chris/
 │   ├── calendarSuggester.js   # 60s poll, filter rules, fire pre-meeting banners
 │   ├── dismissalRegistry.js   # Shared dismiss-state owner (consulted by both)
 │   ├── silenceWatcher.js      # Timer-free silence-streak state machine (auto-stop)
+│   ├── meetingTemplate.js     # Pure: event → context + skeleton markdown (app + MCP share)
+│   ├── meetingFilter.js       # Pure: the eligibility predicate (suggester + MCP share)
+│   ├── preparedMeetingStore.js # Directory-of-files handoff store (app reads/claims, MCP writes)
 │   └── calendarSources/       # Pluggable calendar source layer
 │       ├── index.js
 │       ├── macOSCalendarSource.js  # Spawns calendar-helper Swift CLI
 │       └── gmailCalendarSource.js  # v2 stub
+├── shared/
+│   └── paths.js               # Electron-free frozen paths + calendar-helper resolver (app + MCP share)
+├── mcp/                       # Standalone MCP server (stdio, no Electron, no ports)
+│   ├── server.js              # stdio server; 7 calendar/prepare tools
+│   ├── handlers.js            # Tool definitions + dispatch (pure of the SDK)
+│   ├── calendarFactory.js     # Builds MacOSCalendarSource + process-cleanup shim
+│   └── check.js               # `npm run mcp:check` permission doctor
 ├── utils/
 │   └── audioDevices.js        # BlackHole detection + mic enumeration
 ├── models/                    # whisper.cpp model files (ggml-base.en.bin)
@@ -95,6 +105,14 @@ Qualification: A rule belongs here if (1) violating it breaks the system in non-
    - Why: The always-wired Save button makes a mid-recording settings save reachable; saving silence settings during a recording must not tear down the live recorder.
    - Pattern: `main.js` IPC `settings:update` → `if (!isRecordingActive()) initRecorder();`.
 
+12. **The handoff directory is the ONLY cross-process channel; the MCP server is read/stage-only**: The standalone MCP server (`mcp/server.js`) and the Electron app communicate *exclusively* through the filesystem handoff at `~/Library/Application Support/Notes4Chris/handoff/prepared` (computed by `shared/paths.js`, never `app.getPath`). The MCP server only **reads calendars + stages** prepared meetings (atomic tmp+rename); the app only **reads + claims** them (atomic `rename .json → .applied`). The MCP server NEVER drives a recording — there is no live-control bridge. Both sides build the template from the same `services/meetingTemplate.js` and agree on paths via the same `shared/paths.js`, so a prepared meeting and the recording the app starts can never diverge. Never route this state through `electron-store` (a second writer would clobber it).
+   - Why: Two processes, one with no Electron context, must agree on a path with zero ambiguity (`name:"notes4chris"` vs `productName:"Notes4Chris"` makes `app.getPath('userData')` dev-vs-packaged ambiguous — hence the frozen literal). A live-control bridge would couple the two lifecycles; the file handoff keeps them independent (the app can be closed when meetings are prepared).
+   - Pattern: `shared/paths.js` → `getPreparedDir()`; `services/preparedMeetingStore.js` (filename suffix `.json`/`.applied`/`.cancelled` is the authoritative state); `mcp/handlers.js`; `main.js` IPC `meeting:confirmRecord` → `claim()`.
+
+13. **The skeleton is a sibling file gated on dual-track; the manifest stays flat**: The rich structured note skeleton is written to `<sessionDir>/meeting-skeleton.md` (the human jots live notes here; the AI summary still lands in `notes.md` — they never collide). Only the flat `{title, participants, agenda}` subset reaches `manifest.json` (invariant #2, summariser unchanged). Skeleton writing is gated on `useDual` — system-only mode returns a flat `.wav` with no session dir, so it is skipped + logged (never written to `undefined`).
+   - Why: Widening the manifest with nested keys would fight invariant #2 and the recorder only copies the flat three. A sibling file keeps the rich template without touching the manifest/summariser contract.
+   - Pattern: `main.js` → `writeMeetingSkeleton()` inside `startRecordingWithContext()` (after `dualRecorder.start()`); render via `services/meetingTemplate.js` → `renderSkeletonMarkdown()`.
+
 ## Key Patterns
 
 ### IPC Communication
@@ -116,3 +134,13 @@ Qualification: A rule belongs here if (1) violating it breaks the system in non-
 - `system_profiler SPAudioDataType` parsed for device enumeration
 - Device names at 8-space indent, properties at 10-space indent
 - `listInputDevices()` returns all available input devices
+
+### Calendar-Driven Templated Meetings (+ standalone MCP)
+Two processes that meet only through the filesystem handoff (invariant #12):
+
+1. **Prepare (optional, ahead of time)** — a background process / Claude routine calls the MCP server's `prepare_meeting({fingerprint|eventId})`. The server reuses the EventKit `calendar-helper`, builds the template via `meetingTemplate.js`, and stages a record to `handoff/prepared/cal_<id>.json` (atomic). Works with the app closed. No ports — stdio only.
+2. **Detect** — the app's `MeetingDetector`/`CalendarSuggester` fires on a call. If a `calendarEvent` is present AND `calendarAutoTemplateEnabled` is on, `decideBannerMode()` returns `'confirm'`; else today's `'suggest'` flow is preserved.
+3. **1-click confirm** — the banner shows a single **Record** button → IPC `meeting:confirmRecord` → `buildMeetingContext(event)` → `recordDismissal()` (same `DismissalRegistry`, invariant #8) → `preparedMeetingStore.claim(fp)` (best-effort; works with no prepared file) → `startRecordingWithContext(richCtx)`.
+4. **Skeleton** — after `dualRecorder.start()`, `writeMeetingSkeleton()` writes `meeting-skeleton.md` (invariant #13). The flat `{title,participants,agenda}` still flows to the manifest; the summariser is unchanged.
+
+Permission caveat (gotcha #8): a headless MCP-spawned helper may be keyed to a different code signature than the granted one. `shared/paths.js` prefers the installed app's signed helper; `npm run mcp:check` drives the grant + reports the fix.

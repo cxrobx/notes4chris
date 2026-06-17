@@ -176,6 +176,12 @@
       return truncate(title + suffix, 80);
     }
 
+    // 'confirm' mode is the zero-touch path: a calendar event is present and the
+    // user opted into auto-templating. The primary button becomes "Record" and
+    // starts recording immediately with the templated context. Otherwise we keep
+    // today's "Take notes" → pre-record popup flow untouched.
+    let bannerMode = 'suggest';
+
     (async () => {
       try {
         const ctx = await window.meetingBanner.getContext();
@@ -183,14 +189,23 @@
           const appIcon = document.getElementById('app-icon');
           const appName = document.getElementById('app-name');
           const bannerTitle = document.getElementById('banner-title');
+          const primaryBtn = document.getElementById('btn-take-notes');
           appIcon.dataset.app = ctx.app || '';
           appIcon.textContent = iconGlyphs[ctx.app] || '📹';
+          bannerMode = ctx.bannerMode === 'confirm' ? 'confirm' : 'suggest';
 
           if (ctx.calendarEvent) {
-            // Enriched: show calendar title + attendee count as the subtitle,
-            // and override the headline so the user sees the actual meeting.
-            bannerTitle.textContent = 'Take notes for this meeting';
-            appName.textContent = buildCalendarSubtitle(ctx.calendarEvent);
+            const title = ctx.calendarEvent.title || 'this meeting';
+            if (bannerMode === 'confirm') {
+              // Zero-touch: one click records, nothing is typed.
+              bannerTitle.textContent = `Record “${truncate(title, 48)}”?`;
+              appName.textContent = buildCalendarSubtitle(ctx.calendarEvent);
+              primaryBtn.textContent = 'Record';
+            } else {
+              // Enriched suggestion: show calendar title + attendee count.
+              bannerTitle.textContent = 'Take notes for this meeting';
+              appName.textContent = buildCalendarSubtitle(ctx.calendarEvent);
+            }
           } else {
             appName.textContent = ctx.displayName || 'Meeting';
           }
@@ -205,7 +220,11 @@
     });
 
     document.getElementById('btn-take-notes').addEventListener('click', () => {
-      window.meetingBanner.takeNotes();
+      if (bannerMode === 'confirm') {
+        window.meetingBanner.confirmRecord();
+      } else {
+        window.meetingBanner.takeNotes();
+      }
     });
   </script>
 </body>

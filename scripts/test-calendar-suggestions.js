@@ -509,47 +509,20 @@ async function suite_DetectorEnricher() {
 async function suite_PreRecordSeed() {
   console.log('\n[Pre-record seed building]');
 
-  // Pull the helper functions out of main.js via fresh-load + monkey-patch trick.
-  // Easier: replicate the small helpers here from the source for testing, since
-  // they're pure and don't depend on Electron globals.
-  function buildAgendaFromNotes(notes) {
-    if (typeof notes !== 'string' || !notes) return '';
-    const cleaned = notes
-      .replace(/https?:\/\/\S+/gi, '')
-      .replace(/^.*(zoom\.us|meet\.google\.com|teams\.microsoft\.com|teams\.live\.com)\S*.*$/gim, '')
-      .replace(/^.*Join Zoom Meeting.*$/gim, '')
-      .replace(/^.*Meeting ID:.*$/gim, '')
-      .replace(/^.*Passcode:.*$/gim, '')
-      .replace(/^.*Join Microsoft Teams.*$/gim, '')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-    return cleaned.slice(0, 500);
-  }
-  function attendeeDisplayName(a) {
-    if (!a) return null;
-    if (typeof a.name === 'string' && a.name.trim()) return a.name.trim();
-    if (typeof a.email === 'string' && a.email.includes('@')) return a.email.split('@')[0];
-    return null;
-  }
-  function buildPreRecordSeedFromEvent(event) {
-    if (!event) return null;
-    const attendees = Array.isArray(event.attendees) ? event.attendees : [];
-    const others = attendees.filter(a => !a.isCurrentUser).map(attendeeDisplayName).filter(Boolean);
-    return {
-      title: typeof event.title === 'string' ? event.title : '',
-      participants: others.join(', '),
-      agenda: buildAgendaFromNotes(event.notes)
-    };
-  }
+  // These helpers were lifted out of main.js into services/meetingTemplate.js
+  // (shared with the standalone MCP server). Exercise the REAL exports here.
+  const {
+    buildAgendaFromNotes,
+    attendeeDisplayName,
+    buildPreRecordSeedFromEvent
+  } = require(path.join(repoRoot, 'services/meetingTemplate'));
 
-  // Read the real implementation off disk and string-match to confirm we're
-  // replicating the same logic the app actually runs.
-  const fs = require('fs');
-  const mainSource = fs.readFileSync(path.join(repoRoot, 'main.js'), 'utf8');
-  assert('main.js still defines buildPreRecordSeedFromEvent',
-    /function\s+buildPreRecordSeedFromEvent\s*\(/.test(mainSource));
-  assert('main.js still defines buildAgendaFromNotes',
-    /function\s+buildAgendaFromNotes\s*\(/.test(mainSource));
+  assert('meetingTemplate exports buildPreRecordSeedFromEvent',
+    typeof buildPreRecordSeedFromEvent === 'function');
+  assert('meetingTemplate exports buildAgendaFromNotes',
+    typeof buildAgendaFromNotes === 'function');
+  assert('meetingTemplate exports attendeeDisplayName',
+    typeof attendeeDisplayName === 'function');
 
   // Title + participants + simple agenda
   {

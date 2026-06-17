@@ -21,6 +21,8 @@
  * the detector banner for the same occurrence (and vice versa).
  */
 
+const { passesMeetingFilter } = require('./meetingFilter');
+
 const POLL_INTERVAL_MS = 60_000;
 const ON_DEMAND_REFRESH_TIMEOUT_MS = 500;
 const CURRENT_CACHE_FRESH_MS = POLL_INTERVAL_MS; // cache is good for the length of a poll cycle
@@ -169,23 +171,9 @@ class CalendarSuggester {
   }
 
   _passesFilters(event) {
-    if (!event || typeof event !== 'object') return false;
-    if (event.isAllDay) return false;
-    if (event.declinedByMe) return false;
-
-    const attendees = Array.isArray(event.attendees) ? event.attendees : [];
-    if (attendees.length < 2) return false;
-
-    const denylist = this._store.get('calendarDenylist') || [];
-    if (Array.isArray(denylist) && denylist.length > 0) {
-      const title = (event.title || '').toLowerCase();
-      for (const pattern of denylist) {
-        if (typeof pattern !== 'string' || !pattern.trim()) continue;
-        if (title.includes(pattern.trim().toLowerCase())) return false;
-      }
-    }
-
-    return true;
+    // The eligibility predicate lives in services/meetingFilter so the MCP
+    // server's `preparable` flag and this suggester can never drift.
+    return passesMeetingFilter(event, { denylist: this._store.get('calendarDenylist') || [] });
   }
 
   async _poll() {

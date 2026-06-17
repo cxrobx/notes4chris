@@ -78,6 +78,9 @@ async function loadSettings() {
     const calToggle = document.getElementById('calendar-suggestions-enabled');
     if (calToggle) calToggle.checked = currentSettings.calendarSuggestionsEnabled === true;
 
+    const autoTemplateToggle = document.getElementById('calendar-auto-template-enabled');
+    if (autoTemplateToggle) autoTemplateToggle.checked = currentSettings.calendarAutoTemplateEnabled === true;
+
     const leadInput = document.getElementById('calendar-lead-time');
     if (leadInput) {
       const lead = Number(currentSettings.calendarLeadTimeMinutes);
@@ -693,9 +696,11 @@ async function handleSaveSettings() {
 
     // Calendar settings — collect (best-effort; UI elements always present in v1)
     const calToggle = document.getElementById('calendar-suggestions-enabled');
+    const autoTemplateToggle = document.getElementById('calendar-auto-template-enabled');
     const calLead = document.getElementById('calendar-lead-time');
     const calDenylist = document.getElementById('calendar-denylist');
     const calendarSuggestionsEnabled = calToggle ? calToggle.checked : false;
+    const calendarAutoTemplateEnabled = autoTemplateToggle ? autoTemplateToggle.checked : false;
     const calendarLeadTimeMinutes = calLead ? Math.max(0, Math.min(15, parseInt(calLead.value, 10) || 0)) : 2;
     const calendarDenylist = calDenylist
       ? calDenylist.value.split('\n').map(s => s.trim()).filter(Boolean)
@@ -719,6 +724,7 @@ async function handleSaveSettings() {
       systemLabel: document.getElementById('system-label').value || 'Remote',
       micLabel: document.getElementById('mic-label').value || 'Me',
       calendarSuggestionsEnabled,
+      calendarAutoTemplateEnabled,
       calendarLeadTimeMinutes,
       calendarDenylist,
       silenceAutoStopEnabled,

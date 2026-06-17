@@ -34,6 +34,13 @@ const { MeetingDetector } = require('./services/meetingDetector');
 const { DismissalRegistry } = require('./services/dismissalRegistry');
 const { CalendarSuggester } = require('./services/calendarSuggester');
 const { MacOSCalendarSource } = require('./services/calendarSources');
+const { resolveCalendarHelperPath } = require('./shared/paths');
+const {
+  buildPreRecordSeedFromEvent,
+  buildMeetingContext,
+  renderSkeletonMarkdown
+} = require('./services/meetingTemplate');
+const { PreparedMeetingStore } = require('./services/preparedMeetingStore');
 const { spawn: childSpawn } = require('child_process');
 
 const OBSIDIAN_VAULT_DIRECTORY = path.join(app.getPath('documents'), 'CX');
@@ -56,6 +63,7 @@ const store = new Store({
     useSharedTranscript: true,
     meetingDetectionEnabled: true,
     calendarSuggestionsEnabled: false,
+    calendarAutoTemplateEnabled: false,
     calendarLeadTimeMinutes: 2,
     calendarDenylist: ['Lunch', 'Gym', 'Focus', 'Block', 'OOO', 'Holiday'],
     calendarDismissedFingerprints: [],
@@ -82,7 +90,8 @@ let meetingBannerTimer = null;
 let meetingDetector = null;
 let calendarSuggester = null;
 let dismissalRegistry = null;
-let currentDetection = null; // { app, displayName, fingerprint, calendarEvent? }
+let preparedMeetingStore = null; // filesystem handoff with the standalone MCP server
+let currentDetection = null; // { app, displayName, fingerprint, calendarEvent?, bannerMode }
 let pendingPreRecordContext = null; // seeded from currentDetection.calendarEvent when "Take notes" is clicked
 let recorder = null;
 let dualRecorder = null;
@@ -158,67 +167,21 @@ function getSckBinaryPath() {
 }
 
 /**
- * Resolve path to the calendar-helper binary
+ * Resolve path to the calendar-helper binary. Delegates to the Electron-free
+ * shared resolver so the MCP server and the app agree on path logic. Passes
+ * `process.resourcesPath` only when packaged (authoritative); a dev build keeps
+ * using its freshly-rebuilt local helper.
  */
 function getCalendarHelperPath() {
-  if (app.isPackaged) {
-    return path.join(process.resourcesPath, 'calendar-helper');
-  }
-  return path.join(__dirname, 'native', 'calendar-helper', '.build', 'release', 'calendar-helper');
+  return resolveCalendarHelperPath({
+    resourcesPath: app.isPackaged ? process.resourcesPath : null,
+    repoRoot: __dirname
+  });
 }
 
-/**
- * Strip URLs and common meeting-join boilerplate from event notes so the
- * pre-record popup's agenda field doesn't fill with Zoom/Meet/Teams junk.
- * Cheap regex pass — not a full HTML parse.
- */
-function buildAgendaFromNotes(notes) {
-  if (typeof notes !== 'string' || !notes) return '';
-  const cleaned = notes
-    .replace(/https?:\/\/\S+/gi, '')
-    .replace(/^.*(zoom\.us|meet\.google\.com|teams\.microsoft\.com|teams\.live\.com)\S*.*$/gim, '')
-    .replace(/^.*Join Zoom Meeting.*$/gim, '')
-    .replace(/^.*Meeting ID:.*$/gim, '')
-    .replace(/^.*Passcode:.*$/gim, '')
-    .replace(/^.*Join Microsoft Teams.*$/gim, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-  return cleaned.slice(0, 500);
-}
-
-/**
- * Convert an attendee record into a display name, falling back to the
- * local-part of the email when no name is set (Google Calendar often
- * returns only emails). Returns null when neither is usable.
- */
-function attendeeDisplayName(attendee) {
-  if (!attendee) return null;
-  if (typeof attendee.name === 'string' && attendee.name.trim()) return attendee.name.trim();
-  if (typeof attendee.email === 'string' && attendee.email.includes('@')) {
-    return attendee.email.split('@')[0];
-  }
-  return null;
-}
-
-/**
- * Map a calendar event into the pre-record popup's seed shape.
- *   title         — event.title
- *   participants  — other attendees (current user excluded), joined as "Alice, Bob"
- *   agenda        — first 500 chars of event.notes, URLs/boilerplate stripped
- */
-function buildPreRecordSeedFromEvent(event) {
-  if (!event) return null;
-  const attendees = Array.isArray(event.attendees) ? event.attendees : [];
-  const others = attendees
-    .filter(a => !a.isCurrentUser)
-    .map(attendeeDisplayName)
-    .filter(Boolean);
-  return {
-    title: typeof event.title === 'string' ? event.title : '',
-    participants: others.join(', '),
-    agenda: buildAgendaFromNotes(event.notes)
-  };
-}
+// buildAgendaFromNotes / attendeeDisplayName / buildPreRecordSeedFromEvent now
+// live in services/meetingTemplate.js (shared with the MCP server). Imported at
+// the top of this file.
 
 /**
  * Register a child process for cleanup on app exit
@@ -708,12 +671,30 @@ function startCalendarSuggesterIfEnabled() {
 }
 
 /**
+ * Decide which banner UX to show for a (possibly enriched) detection.
+ *   'confirm' — a calendar event is present AND the user opted into
+ *               auto-templating: a 1-click "Record [Title]?" button that starts
+ *               recording immediately with the templated context (zero typing).
+ *   'suggest' — today's flow, fully preserved: a "Take notes" button that opens
+ *               the pre-record popup for the user to confirm/edit fields.
+ * Never auto-starts without a calendar event or without the opt-in.
+ */
+function decideBannerMode(calendarEvent) {
+  return (calendarEvent && store.get('calendarAutoTemplateEnabled')) ? 'confirm' : 'suggest';
+}
+
+/**
  * Initialize the meeting detector and calendar suggester. Called once during
  * app ready. The detector gets an enricher callback that reads the
  * suggester's cached "current" event with an on-demand refresh fallback.
  */
 function initMeetingAndCalendar() {
   dismissalRegistry = new DismissalRegistry({ store });
+
+  // The read/claim side of the cross-process handoff. The standalone MCP server
+  // stages prepared meetings into the same directory (shared/paths.js); the app
+  // only ever reads + claims (never writes), so the two can't clobber each other.
+  preparedMeetingStore = new PreparedMeetingStore();
 
   // Always construct the suggester so settings:update can start/stop it later
   // even if the feature was off at boot. The source itself is cheap to hold
@@ -736,7 +717,8 @@ function initMeetingAndCalendar() {
         app: 'calendar',
         displayName: suggestion.event.title || 'Upcoming meeting',
         fingerprint: suggestion.fingerprint,
-        calendarEvent: suggestion.event
+        calendarEvent: suggestion.event,
+        bannerMode: decideBannerMode(suggestion.event)
       });
     }
   });
@@ -755,6 +737,7 @@ function initMeetingAndCalendar() {
     // Defensive: if a recording started between polls, don't show the banner
     if (isRecordingActive()) return;
     console.log(`Meeting detected: ${detection.displayName} (${detection.fingerprint})`);
+    detection.bannerMode = decideBannerMode(detection.calendarEvent);
     createMeetingBanner(detection);
   });
 
@@ -765,11 +748,39 @@ function initMeetingAndCalendar() {
 }
 
 /**
- * Actually start the recording after context is collected
+ * Write the structured note skeleton beside a dual-track session. The human
+ * jots live notes into `meeting-skeleton.md`; the AI summary still lands in
+ * `notes.md` (they never collide). Non-fatal: a skeleton-write failure must
+ * never abort a recording that has already started.
+ */
+function writeMeetingSkeleton(sessionDir, meetingContext) {
+  if (!sessionDir) return;
+  try {
+    const md = renderSkeletonMarkdown(meetingContext || {});
+    const skeletonPath = path.join(sessionDir, 'meeting-skeleton.md');
+    fs.writeFileSync(skeletonPath, md, 'utf-8');
+    console.log(`Meeting skeleton written: ${skeletonPath}`);
+  } catch (err) {
+    console.warn(`Failed to write meeting skeleton (non-fatal): ${err.message}`);
+  }
+}
+
+/**
+ * Actually start the recording after context is collected. `meetingContext` may
+ * be the bare flat {title, participants, agenda} (manual / pre-record popup) or
+ * the rich superset from buildMeetingContext (1-click calendar confirm). Only
+ * the flat subset is persisted to the store + manifest (invariant #2); the rich
+ * context drives the skeleton render.
  */
 function startRecordingWithContext(meetingContext) {
-  // Save context for next time
-  store.set('meetingContext', meetingContext);
+  // Persist only the flat subset for the recorder/summariser contract — the
+  // manifest stays flat, the summariser is unchanged. Rich fields (attendees,
+  // organiser, joinUrl) live in the skeleton, not the store.
+  store.set('meetingContext', {
+    title: (meetingContext && meetingContext.title) || '',
+    participants: (meetingContext && meetingContext.participants) || '',
+    agenda: (meetingContext && meetingContext.agenda) || ''
+  });
 
   // Reinitialize recorder so it picks up the new context
   initRecorder();
@@ -789,6 +800,8 @@ function startRecordingWithContext(meetingContext) {
         console.warn(warning);
       });
       console.log(`Dual recording started in: ${result.sessionDir}`);
+      // Only dual-track mode has a session dir — write the skeleton there.
+      writeMeetingSkeleton(result.sessionDir, meetingContext);
     } else {
       // System-only mode
       const result = recorder.start((warning) => {
@@ -796,6 +809,8 @@ function startRecordingWithContext(meetingContext) {
       });
       currentRecordingPath = result.filepath;
       console.log(`Recording started: ${currentRecordingPath}`);
+      // System-only mode returns a flat .wav with no session dir → no skeleton.
+      console.log('System-only recording — skipping meeting skeleton (no session directory)');
     }
 
     statusUpdateInterval = setInterval(() => {
@@ -1585,6 +1600,42 @@ ipcMain.handle('meeting:takeNotes', async () => {
   return { success: true };
 });
 
+// 1-click confirm: start recording immediately with the fully-templated context
+// from the calendar event — zero typing. Only reachable from a 'confirm' banner,
+// which itself requires both a calendar event and the auto-template opt-in.
+ipcMain.handle('meeting:confirmRecord', async () => {
+  const detection = currentDetection;
+  if (!detection || !detection.calendarEvent) {
+    // Defensive: the Record button is only shown in confirm mode, but if we
+    // somehow get here without an event, fall back to the take-notes popup
+    // rather than starting a context-less recording.
+    closeMeetingBanner(false);
+    showPreRecordPopup();
+    return { success: false, error: 'no-calendar-event' };
+  }
+
+  // Build the rich, fully-templated context from the live calendar event.
+  const richCtx = buildMeetingContext(detection.calendarEvent);
+
+  // Same single dismissal registry (invariant #8) so this occurrence won't
+  // re-fire a banner the moment the call app is detected.
+  recordDismissal(detection);
+
+  // Claim any meeting the MCP server pre-staged for this occurrence: a best-
+  // effort atomic state transition (.json → .applied) so it isn't reprocessed.
+  // Absence is fine — the in-app path works with no prepared file at all.
+  if (preparedMeetingStore && richCtx && richCtx.occurrenceFingerprint) {
+    const claimed = preparedMeetingStore.claim(richCtx.occurrenceFingerprint);
+    if (claimed.ok) {
+      console.log(`Claimed prepared meeting: ${richCtx.occurrenceFingerprint}`);
+    }
+  }
+
+  closeMeetingBanner(false);
+  startRecordingWithContext(richCtx);
+  return { success: true };
+});
+
 ipcMain.handle('meeting:dismiss', async () => {
   closeMeetingBanner(true);
   return { success: true };
@@ -2138,6 +2189,7 @@ ipcMain.handle('settings:get', async () => {
     meetingContext: store.get('meetingContext'),
     meetingDetectionEnabled: store.get('meetingDetectionEnabled'),
     calendarSuggestionsEnabled: store.get('calendarSuggestionsEnabled'),
+    calendarAutoTemplateEnabled: store.get('calendarAutoTemplateEnabled'),
     calendarLeadTimeMinutes: store.get('calendarLeadTimeMinutes'),
     calendarDenylist: store.get('calendarDenylist'),
     silenceAutoStopEnabled: store.get('silenceAutoStopEnabled'),
@@ -2192,6 +2244,14 @@ ipcMain.handle('settings:update', async (event, settings) => {
         } else {
           calendarSuggester.stop();
         }
+      }
+    }
+    if (settings.calendarAutoTemplateEnabled !== undefined) {
+      // Pure preference flip — no recorder/detector/suggester side effects. It
+      // only changes which banner UX (confirm vs suggest) the next detection
+      // shows, so it must NOT trigger initRecorder() (invariant #11).
+      if (typeof settings.calendarAutoTemplateEnabled === 'boolean') {
+        store.set('calendarAutoTemplateEnabled', settings.calendarAutoTemplateEnabled);
       }
     }
     if (settings.calendarLeadTimeMinutes !== undefined) {

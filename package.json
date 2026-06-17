@@ -12,6 +12,10 @@
     "build": "electron-builder",
     "postinstall": "electron-builder install-app-deps",
     "summaryonly": "node summarise-only.js",
+    "mcp": "node mcp/server.js",
+    "mcp:check": "node mcp/check.js",
+    "lint:british": "node scripts/check-british-english.js",
+    "pretest": "node scripts/check-british-english.js",
     "test": "node --test '**/*.test.js'",
     "test:watch": "node --test --watch '**/*.test.js'"
   },
@@ -29,6 +33,7 @@
   "author": "Christopher Robinson",
   "license": "SEE LICENSE IN LICENSE",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "electron-store": "^8.2.0"
   },
   "devDependencies": {

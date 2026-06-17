@@ -518,7 +518,7 @@ Brief summary of what this meeting was about.
 The most important outcomes or decisions.
 
 ## Topics Discussed
-Organized by topic, noting who raised each point.
+Organised by topic, noting who raised each point.
 
 ## Action Items
 All action items with owner attribution:

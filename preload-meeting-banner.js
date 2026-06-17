@@ -8,5 +8,6 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('meetingBanner', {
   getContext: () => ipcRenderer.invoke('meeting:getContext'),
   takeNotes: () => ipcRenderer.invoke('meeting:takeNotes'),
+  confirmRecord: () => ipcRenderer.invoke('meeting:confirmRecord'),
   dismiss: () => ipcRenderer.invoke('meeting:dismiss')
 });

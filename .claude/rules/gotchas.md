@@ -1,6 +1,6 @@
 # Known Gotchas
 
-Organised by category. 7 items, condensed format. Original numbering preserved (gaps intentional).
+Organised by category. 8 items, condensed format. Original numbering preserved (gaps intentional).
 
 ## Index
 
@@ -13,6 +13,7 @@ Organised by category. 7 items, condensed format. Original numbering preserved (
 | 5 | SCK delivers zero-filled frames with ARK.driver loaded | Environment |
 | 6 | "Both tracks silent" — compound failure diagnostic | Backend |
 | 7 | EventKit permission prompt timing + per-binary-signature trigger | Environment |
+| 8 | MCP-spawned calendar-helper can't inherit the app's Calendar grant | Environment |
 
 ---
 
@@ -78,6 +79,15 @@ Organised by category. 7 items, condensed format. Original numbering preserved (
 - `codesign -dv native/calendar-helper/.build/release/calendar-helper 2>&1 | grep TeamIdentifier` — if this changes between builds, expect re-prompts.
 **Solution**: Always sign the helper with the same identity used for the parent app (`-`/ad-hoc for local builds, the same Developer ID for distribution). The helper's own `Info.plist` must carry both the legacy and full-access usage strings; missing the macOS-14 string causes the prompt to silently never fire on macOS 14+.
 **Pattern**: `native/calendar-helper/Info.plist`, `native/calendar-helper/CalendarHelper.entitlements`, `package.json` `scripts.build:calendar`, `setup.sh` calendar-helper build step.
+
+### 8. MCP-Spawned calendar-helper Can't Inherit the App's Calendar Grant
+**Symptom**: The standalone MCP server's calendar tools (`list_upcoming_meetings`, `prepare_meeting`) return a permission error even though the **app** has Calendar access. Spawning the dev helper from a plain `node` parent returns exit 2 (`{"status":"denied"}`) — it never prompts.
+**Cause**: This is gotcha #7 from the MCP angle. macOS keys the Calendar (TCC) grant to the helper binary's **code signature**. The packaged app's helper is Developer-ID-signed (`TeamIdentifier=CCYV5HQZCM`) and owns the granted permission; an ad-hoc dev build (`TeamIdentifier=not set`) is a *different file* with a different signature → its own (denied/not-determined) decision. A headless spawn also lacks the GUI responsibility attribution that surfaces the prompt, so it silently returns denied rather than prompting (verified in Phase 0).
+**Diagnostic**:
+- `npm run mcp:check` — the doctor prints the resolved helper path, whether the installed signed helper is present, the handoff dir, and the live permission state. Exit 0 = ready, 1 = helper missing, 2 = not granted.
+- `node -e 'require("child_process").spawn("<helper>", ["request-access"], {stdio:["ignore","inherit","inherit"]})'` — exit 2 = denied, 3 = not-determined, 0 = granted.
+**Solution**: `shared/paths.js` `resolveCalendarHelperPath({ preferInstalled: true })` makes the MCP server prefer `/Applications/Notes4Chris.app/Contents/Resources/calendar-helper` (the signed, grant-carrying binary) over the dev build. Grant Calendar access to the app once (it prompts on first calendar use), then the MCP server rides that grant. Tools surface denial as `{ error, message, fix }` (never a silent empty list); `list_prepared_meetings`/`cancel_prepared_meeting` work without any Calendar access.
+**Pattern**: `shared/paths.js` → `resolveCalendarHelperPath()`, `INSTALLED_HELPER_PATH`; `mcp/calendarFactory.js` → `createCalendarSource()`; `mcp/check.js`; `mcp/handlers.js` → `permissionError()`.
 
 ## Lifecycle Management
 
