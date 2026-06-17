@@ -100,10 +100,6 @@ async function transcribe(wavPath, outputDir, progressCallback, outputPrefix, ou
     throw new Error(`Audio file not found: ${wavPath}`);
   }
 
-  // Get whisper binary and model
-  const whisperBin = findWhisperBinary();
-  const modelPath = findWhisperModel();
-
   // Ensure processed directory exists
   const processedDir = path.join(outputDir, 'processed');
   if (!fs.existsSync(processedDir)) {
@@ -115,6 +111,30 @@ async function transcribe(wavPath, outputDir, progressCallback, outputPrefix, ou
 
   console.log(`Starting transcription: ${wavPath}`);
   console.log(`Output prefix: ${prefix}`);
+
+  // Parakeet (NVIDIA Parakeet-TDT via parakeet-mlx) is the DEFAULT backend —
+  // best local accuracy on meeting speech, fully on-device. Falls back to
+  // whisper.cpp if `uv` is unavailable or Parakeet fails. Force whisper with
+  // NOTES4CHRIS_TRANSCRIBER=whisper.
+  const forceWhisper = (process.env.NOTES4CHRIS_TRANSCRIBER || '').toLowerCase() === 'whisper';
+  if (!forceWhisper && findUv()) {
+    try {
+      return await transcribeWithParakeet(wavPath, prefix, outputCsv, progressCallback);
+    } catch (err) {
+      console.warn(`[transcriber] Parakeet failed (${err.message}) — falling back to whisper.cpp`);
+    }
+  }
+  return transcribeWithWhisper(wavPath, prefix, outputCsv, progressCallback);
+}
+
+/**
+ * Transcribe a single WAV with whisper.cpp (the fallback backend).
+ * @returns {Promise<string>} Path to the generated .txt transcript
+ */
+function transcribeWithWhisper(wavPath, prefix, outputCsv, progressCallback) {
+  // Get whisper binary and model
+  const whisperBin = findWhisperBinary();
+  const modelPath = findWhisperModel();
 
   // Calculate timeout based on file size: 10 minutes per 20MB, minimum 5 minutes
   const fileSizeBytes = fs.statSync(wavPath).size;
@@ -213,6 +233,111 @@ async function transcribe(wavPath, outputDir, progressCallback, outputPrefix, ou
   });
 }
 
+/** Locate the `uvx` runner (Parakeet runs via uv with PEP-723 inline deps). */
+function findUv() {
+  const candidates = [
+    path.join(process.env.HOME || '', '.local/bin/uvx'),
+    '/opt/homebrew/bin/uvx',
+    '/usr/local/bin/uvx',
+  ];
+  for (const c of candidates) {
+    if (c && fs.existsSync(c)) return c;
+  }
+  return null;
+}
+
+/**
+ * Transcribe a single WAV with Parakeet (parakeet-mlx via uvx), writing the
+ * whisper-compatible outputs notes4chris expects: `${prefix}.txt` and, when
+ * outputCsv, `${prefix}.csv` in whisper's `start_ms,end_ms,"text"` format so
+ * the dual-track merger keeps working unchanged.
+ * @returns {Promise<string>} Path to the generated .txt transcript
+ */
+function transcribeWithParakeet(wavPath, prefix, outputCsv, progressCallback) {
+  const uvx = findUv();
+  if (!uvx) return Promise.reject(new Error('uv/uvx not found'));
+
+  return new Promise((resolve, reject) => {
+    const outDir = path.dirname(prefix);
+    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+    // parakeet-mlx writes <output-dir>/<wav-basename>.json
+    const jsonOut = path.join(outDir, `${path.basename(wavPath, '.wav')}.json`);
+
+    const fileSizeMB = fs.statSync(wavPath).size / (1024 * 1024);
+    const timeoutMs = Math.max(5 * 60 * 1000, Math.ceil(fileSizeMB / 20) * 10 * 60 * 1000);
+
+    console.log(`Parakeet transcription: ${wavPath} -> ${prefix}.txt`);
+    const args = ['parakeet-mlx', wavPath, '--output-format', 'json', '--output-dir', outDir];
+    const proc = spawn(uvx, args, { env: process.env });
+    let settled = false;
+    let stderr = '';
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      proc.kill('SIGKILL');
+      reject(new Error(`Parakeet timed out after ${Math.round(timeoutMs / 60000)} min`));
+    }, timeoutMs);
+
+    if (progressCallback) progressCallback(10);
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`Failed to start uvx parakeet-mlx: ${err.message}`));
+    });
+    proc.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(`parakeet-mlx exited ${code}\n${stderr.slice(-500)}`));
+        return;
+      }
+      try {
+        if (!fs.existsSync(jsonOut)) throw new Error(`Parakeet JSON not created: ${jsonOut}`);
+        const result = JSON.parse(fs.readFileSync(jsonOut, 'utf-8'));
+        const sentences = Array.isArray(result.sentences) ? result.sentences : [];
+
+        // .txt — one sentence per line (mirrors whisper -otxt segmentation).
+        const txtBody = sentences.length
+          ? sentences.map((s) => (s.text || '').trim()).filter(Boolean).join('\n')
+          : (result.text || '').trim();
+        fs.writeFileSync(`${prefix}.txt`, txtBody + '\n', 'utf-8');
+
+        // .csv — whisper format: start_ms,end_ms,"text" (for dual-track merge).
+        if (outputCsv) {
+          const rows = sentences.map((s) => {
+            const start = Math.round((s.start || 0) * 1000);
+            const end = Math.round((s.end || 0) * 1000);
+            // Collapse whitespace (sentences are single-line) and wrap in one
+            // quote pair WITHOUT doubling internal quotes — transcriptMerger's
+            // parseCsvTranscript strips exactly one outer pair and does not
+            // un-escape, so inner quotes must pass through verbatim.
+            const text = (s.text || '').trim().replace(/\s+/g, ' ');
+            return `${start},${end},"${text}"`;
+          });
+          fs.writeFileSync(`${prefix}.csv`, rows.join('\n') + '\n', 'utf-8');
+        }
+
+        try { fs.unlinkSync(jsonOut); } catch { /* best effort */ }
+        if (progressCallback) progressCallback(100);
+
+        const txtPath = `${prefix}.txt`;
+        if (fs.statSync(txtPath).size === 0) {
+          reject(new Error('Transcript file is empty. Audio may be silent or corrupted.'));
+          return;
+        }
+        console.log(`Parakeet transcription complete: ${txtPath}`);
+        resolve(txtPath);
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
 /**
  * Transcribe a dual-track session
  *
@@ -298,6 +423,12 @@ async function transcribeSession(sessionDir, outputDir, progressCallback, option
   const micWav = path.join(sessionDir, manifest.tracks.mic.file);
   const systemUsable = fs.existsSync(systemWav) && fs.statSync(systemWav).size > 44;
   const micUsable = fs.existsSync(micWav) && fs.statSync(micWav).size > 44;
+
+  // Defensive: real recording manifests carry a processing.transcription block,
+  // but a minimal/older manifest may not — lazy-create it so the assignments
+  // below never throw and reject an otherwise-successful transcription+merge.
+  manifest.processing = manifest.processing || {};
+  manifest.processing.transcription = manifest.processing.transcription || {};
 
   const systemPromise = systemUsable
     ? (async () => {

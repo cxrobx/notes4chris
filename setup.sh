@@ -135,6 +135,25 @@ else
 fi
 echo ""
 
+# ── Parakeet (default transcription backend) ─────────────────────────────────
+# Parakeet-TDT (via parakeet-mlx) is the default transcriber — best local
+# accuracy on meeting speech, fully on-device. Runs via `uv`; whisper.cpp stays
+# as the automatic fallback. Force whisper with NOTES4CHRIS_TRANSCRIBER=whisper.
+echo "🦜 Setting up Parakeet (default transcription backend)..."
+if command -v uv >/dev/null 2>&1; then
+  echo "  uv found: $(command -v uv)"
+  echo "  Pre-pulling the Parakeet model (parakeet-tdt-0.6b-v3, ~2.3GB)..."
+  if uvx --from parakeet-mlx python -c "from parakeet_mlx import from_pretrained; from_pretrained('mlx-community/parakeet-tdt-0.6b-v3'); print('ok')" >/dev/null 2>&1; then
+    echo "  ✅ Parakeet model ready."
+  else
+    echo "  ⚠️  Parakeet model pre-pull failed — it will download on first transcription."
+  fi
+else
+  echo "  ⚠️  'uv' not installed — Parakeet needs it; transcription falls back to whisper.cpp."
+  echo "      Install:  curl -LsSf https://astral.sh/uv/install.sh | sh"
+fi
+echo ""
+
 echo "================================"
 echo "✅ Setup complete!"
 echo ""
